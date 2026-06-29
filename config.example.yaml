@@ -160,7 +160,10 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, expiry-priority
+  # Expiration window used by expiry-priority. Credentials expiring within this window
+  # are preferred, with earlier expiration selected first. Default: 5h
+  expiry-priority-window: "5h"
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Client-Request-Id (PI), conversation_id,

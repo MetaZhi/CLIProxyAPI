@@ -124,6 +124,55 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 }
 
+func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindow(t *testing.T) {
+	t.Parallel()
+
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	now := time.Now()
+	auths := []*Auth{
+		{ID: "late", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
+		{ID: "soon", Metadata: map[string]any{"expires_at": now.Add(90 * time.Minute).Format(time.RFC3339)}},
+		{ID: "outside", Metadata: map[string]any{"expires_at": now.Add(8 * time.Hour).Format(time.RFC3339)}},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "soon" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "soon")
+	}
+}
+
+func TestExpiryPrioritySelectorPick_FallsBackToRoundRobinWhenNoExpiringAuths(t *testing.T) {
+	t.Parallel()
+
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	now := time.Now()
+	auths := []*Auth{
+		{ID: "b", Metadata: map[string]any{"expires_at": now.Add(7 * time.Hour).Format(time.RFC3339)}},
+		{ID: "a"},
+		{ID: "c", Metadata: map[string]any{"expires_at": now.Add(10 * time.Hour).Format(time.RFC3339)}},
+	}
+
+	want := []string{"a", "b", "c", "a"}
+	for index, wantID := range want {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
 func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	selector := &RoundRobinSelector{}
 	auths := []*Auth{

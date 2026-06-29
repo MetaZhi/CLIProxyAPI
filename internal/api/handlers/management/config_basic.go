@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -286,6 +287,8 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 		return "round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
+	case "expiry-priority", "expirypriority", "ep":
+		return "expiry-priority", true
 	default:
 		return "", false
 	}
@@ -314,6 +317,52 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.Strategy = normalized
+	h.persist(c)
+}
+
+func normalizeExpiryPriorityWindow(raw string) (string, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return coreauth.DefaultExpiryPriorityWindowString, true
+	}
+	if _, err := time.ParseDuration(value); err != nil {
+		return "", false
+	}
+	duration, err := coreauth.ParseExpiryPriorityWindow(value)
+	if err != nil || duration <= 0 {
+		return "", false
+	}
+	return value, true
+}
+
+// RoutingExpiryPriorityWindow
+func (h *Handler) GetRoutingExpiryPriorityWindow(c *gin.Context) {
+	value, ok := normalizeExpiryPriorityWindow(h.cfg.Routing.ExpiryPriorityWindow)
+	if !ok {
+		c.JSON(200, gin.H{"expiry-priority-window": strings.TrimSpace(h.cfg.Routing.ExpiryPriorityWindow)})
+		return
+	}
+	c.JSON(200, gin.H{"expiry-priority-window": value})
+}
+
+func (h *Handler) PutRoutingExpiryPriorityWindow(c *gin.Context) {
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	value := strings.TrimSpace(*body.Value)
+	if value == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expiry-priority-window"})
+		return
+	}
+	if _, errParse := coreauth.ParseExpiryPriorityWindow(value); errParse != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expiry-priority-window"})
+		return
+	}
+	h.cfg.Routing.ExpiryPriorityWindow = value
 	h.persist(c)
 }
 

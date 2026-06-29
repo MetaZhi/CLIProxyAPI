@@ -328,8 +328,12 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "expiry-priority".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// ExpiryPriorityWindow defines the expiration window used by the "expiry-priority" strategy.
+	// Default: 5h. Accepts duration strings like "2h", "5h", "8h30m".
+	ExpiryPriorityWindow string `yaml:"expiry-priority-window,omitempty" json:"expiry-priority-window,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:

@@ -313,7 +313,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *FillFirstSelector, *ExpiryPrioritySelector:
 		return true
 	default:
 		return false
@@ -508,6 +508,13 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	if m.scheduler != nil {
+		window, err := ParseExpiryPriorityWindow(cfg.Routing.ExpiryPriorityWindow)
+		if err != nil {
+			window = DefaultExpiryPriorityWindow
+		}
+		m.scheduler.setExpiryPriorityWindow(window)
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -1547,6 +1554,8 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 		return schedulerStrategyRoundRobin, true
 	case pluginapi.SchedulerBuiltinFillFirst:
 		return schedulerStrategyFillFirst, true
+	case pluginapi.SchedulerBuiltinExpiryPriority:
+		return schedulerStrategyExpiry, true
 	default:
 		return schedulerStrategyCustom, false
 	}

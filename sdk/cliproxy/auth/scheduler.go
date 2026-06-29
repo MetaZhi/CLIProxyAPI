@@ -19,6 +19,7 @@ const (
 	schedulerStrategyCustom     schedulerStrategy = 0
 	schedulerStrategyRoundRobin schedulerStrategy = 1
 	schedulerStrategyFillFirst  schedulerStrategy = 2
+	schedulerStrategyExpiry     schedulerStrategy = 3
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -35,6 +36,7 @@ const (
 type authScheduler struct {
 	mu            sync.Mutex
 	strategy      schedulerStrategy
+	expiryWindow  time.Duration
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
@@ -125,6 +127,7 @@ func normalizeCursor(cursor, size int) int {
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
 		strategy:      selectorStrategy(selector),
+		expiryWindow:  selectorExpiryPriorityWindow(selector),
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
@@ -136,10 +139,21 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 	switch selector.(type) {
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
+	case *ExpiryPrioritySelector:
+		return schedulerStrategyExpiry
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
 		return schedulerStrategyCustom
+	}
+}
+
+func selectorExpiryPriorityWindow(selector Selector) time.Duration {
+	switch current := selector.(type) {
+	case *ExpiryPrioritySelector:
+		return current.expiryPriorityWindow()
+	default:
+		return DefaultExpiryPriorityWindow
 	}
 }
 
@@ -151,7 +165,17 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
+	s.expiryWindow = selectorExpiryPriorityWindow(selector)
 	clear(s.mixedCursors)
+}
+
+func (s *authScheduler) setExpiryPriorityWindow(window time.Duration) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.expiryWindow = normalizeExpiryPriorityWindow(window)
+	s.mu.Unlock()
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -235,7 +259,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, s.expiryWindow, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -304,7 +328,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, s.expiryWindow, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -344,12 +368,36 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, s.expiryWindow, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
 		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	}
+
+	if strategy == schedulerStrategyExpiry {
+		var pickedAuth *Auth
+		pickedProvider := ""
+		pickedExpiry := time.Time{}
+		for providerIndex, providerKey := range normalized {
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			candidate, expiresAt := shard.pickExpiringAtPriorityLocked(false, bestPriority, s.expiryWindow, predicate)
+			if candidate == nil {
+				continue
+			}
+			if pickedAuth == nil || expiresAt.Before(pickedExpiry) || (expiresAt.Equal(pickedExpiry) && candidate.ID < pickedAuth.ID) {
+				pickedAuth = candidate
+				pickedProvider = providerKey
+				pickedExpiry = expiresAt
+			}
+		}
+		if pickedAuth != nil {
+			return pickedAuth, pickedProvider, nil
+		}
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
@@ -398,7 +446,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, s.expiryWindow, predicate)
 		if picked == nil {
 			continue
 		}
@@ -731,7 +779,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -740,7 +788,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, expiryWindow, predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -776,7 +824,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -791,6 +839,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
+	} else if strategy == schedulerStrategyExpiry {
+		picked = view.pickExpiryPriority(time.Now(), expiryWindow, predicate)
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -798,6 +848,25 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+func (m *modelScheduler) pickExpiringAtPriorityLocked(preferWebsocket bool, priority int, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) (*Auth, time.Time) {
+	if m == nil {
+		return nil, time.Time{}
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return nil, time.Time{}
+	}
+	view := &bucket.all
+	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
+		view = &bucket.ws
+	}
+	picked, expiresAt := view.firstExpiryPriorityCandidate(time.Now(), expiryWindow, predicate)
+	if picked == nil || picked.auth == nil {
+		return nil, time.Time{}
+	}
+	return picked.auth, expiresAt
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
@@ -973,4 +1042,44 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		return entry
 	}
 	return nil
+}
+
+func (v *readyView) pickExpiryPriority(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	picked, _ := v.firstExpiryPriorityCandidate(now, window, predicate)
+	if picked != nil {
+		return picked
+	}
+	return v.pickRoundRobin(func(entry *scheduledAuth) bool {
+		if predicate != nil && !predicate(entry) {
+			return false
+		}
+		_, expiring := scheduledAuthWithinExpiryPriorityWindow(entry, now, window)
+		return !expiring
+	})
+}
+
+func (v *readyView) firstExpiryPriorityCandidate(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) (*scheduledAuth, time.Time) {
+	var picked *scheduledAuth
+	var pickedExpiry time.Time
+	for _, entry := range v.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		expiresAt, ok := scheduledAuthWithinExpiryPriorityWindow(entry, now, window)
+		if !ok {
+			continue
+		}
+		if picked == nil || expiresAt.Before(pickedExpiry) || (expiresAt.Equal(pickedExpiry) && entry.auth.ID < picked.auth.ID) {
+			picked = entry
+			pickedExpiry = expiresAt
+		}
+	}
+	return picked, pickedExpiry
+}
+
+func scheduledAuthWithinExpiryPriorityWindow(entry *scheduledAuth, now time.Time, window time.Duration) (time.Time, bool) {
+	if entry == nil || entry.auth == nil {
+		return time.Time{}, false
+	}
+	return authWithinExpiryPriorityWindow(entry.auth, now, window)
 }

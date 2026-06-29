@@ -22,6 +22,10 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+const DefaultExpiryPriorityWindowString = "5h"
+
+var DefaultExpiryPriorityWindow = mustParseExpiryPriorityDefaultWindow()
+
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
 	mu      sync.Mutex
@@ -33,6 +37,13 @@ type RoundRobinSelector struct {
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
+
+// ExpiryPrioritySelector prioritizes credentials whose expiration is within the configured window.
+// Among expiring credentials, the earliest expiration wins; otherwise selection falls back to round-robin.
+type ExpiryPrioritySelector struct {
+	Window     time.Duration
+	roundRobin RoundRobinSelector
+}
 
 type blockReason int
 
@@ -253,6 +264,69 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
+func mustParseExpiryPriorityDefaultWindow() time.Duration {
+	window, err := time.ParseDuration(DefaultExpiryPriorityWindowString)
+	if err != nil {
+		panic(fmt.Sprintf("invalid default expiry priority window: %v", err))
+	}
+	return window
+}
+
+func normalizeExpiryPriorityWindow(window time.Duration) time.Duration {
+	if window <= 0 {
+		return DefaultExpiryPriorityWindow
+	}
+	return window
+}
+
+func ParseExpiryPriorityWindow(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultExpiryPriorityWindow, nil
+	}
+	window, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if window <= 0 {
+		return 0, fmt.Errorf("duration must be greater than zero")
+	}
+	return window, nil
+}
+
+func authWithinExpiryPriorityWindow(auth *Auth, now time.Time, window time.Duration) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	expiresAt, ok := auth.ExpirationTime()
+	if !ok || expiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 || remaining > window {
+		return time.Time{}, false
+	}
+	return expiresAt, true
+}
+
+func pickExpiryPriorityAuth(auths []*Auth, now time.Time, window time.Duration) (*Auth, bool) {
+	window = normalizeExpiryPriorityWindow(window)
+	var picked *Auth
+	var pickedExpiry time.Time
+	for i := 0; i < len(auths); i++ {
+		candidate := auths[i]
+		expiresAt, ok := authWithinExpiryPriorityWindow(candidate, now, window)
+		if !ok {
+			continue
+		}
+		if picked == nil || expiresAt.Before(pickedExpiry) || (expiresAt.Equal(pickedExpiry) && candidate.ID < picked.ID) {
+			picked = candidate
+			pickedExpiry = expiresAt
+		}
+	}
+	return picked, picked != nil
+}
+
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
@@ -300,6 +374,30 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+func NewExpiryPrioritySelector(window time.Duration) *ExpiryPrioritySelector {
+	return &ExpiryPrioritySelector{Window: normalizeExpiryPriorityWindow(window)}
+}
+
+func (s *ExpiryPrioritySelector) expiryPriorityWindow() time.Duration {
+	if s == nil {
+		return DefaultExpiryPriorityWindow
+	}
+	return normalizeExpiryPriorityWindow(s.Window)
+}
+
+func (s *ExpiryPrioritySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if picked, ok := pickExpiryPriorityAuth(available, now, s.expiryPriorityWindow()); ok {
+		return picked, nil
+	}
+	return (&s.roundRobin).Pick(ctx, provider, model, opts, available)
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {

@@ -148,6 +148,100 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_ExpiryPriorityPrefersSoonestExpiring(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewExpiryPrioritySelector(5*time.Hour),
+		&Auth{ID: "later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
+		&Auth{ID: "soon", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339)}},
+		&Auth{ID: "outside", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(8 * time.Hour).Format(time.RFC3339)}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "soon" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "soon")
+	}
+}
+
+func TestSchedulerPick_ExpiryPriorityFallsBackToRoundRobin(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewExpiryPrioritySelector(5*time.Hour),
+		&Auth{ID: "b", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(8 * time.Hour).Format(time.RFC3339)}},
+		&Auth{ID: "a", Provider: "gemini"},
+		&Auth{ID: "c", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(9 * time.Hour).Format(time.RFC3339)}},
+	)
+
+	want := []string{"a", "b", "c", "a"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_ExpiryPriorityRespectsPriorityBuckets(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewExpiryPrioritySelector(5*time.Hour),
+		&Auth{ID: "low-expiring", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}},
+		&Auth{ID: "high-later", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "high-later" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "high-later")
+	}
+}
+
+func TestSchedulerPick_ExpiryPriorityPrefersWebsocketSubset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewExpiryPrioritySelector(5*time.Hour),
+		&Auth{ID: "codex-http-soon", Provider: "codex", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}},
+		&Auth{ID: "codex-ws-later", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"expires_at": now.Add(90 * time.Minute).Format(time.RFC3339)}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-ws-later" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "codex-ws-later")
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -673,6 +767,34 @@ func TestManagerPluginSchedulerDelegatesBuiltin(t *testing.T) {
 			t.Fatalf("fill-first pick = %q, want auth-a", got.ID)
 		}
 	})
+
+	t.Run("expiry-priority", func(t *testing.T) {
+		now := time.Now()
+		manager := NewManager(nil, &RoundRobinSelector{}, nil)
+		manager.executors["gemini"] = schedulerTestExecutor{}
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}}); errRegister != nil {
+			t.Fatalf("Register(later) error = %v", errRegister)
+		}
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "soon", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(90 * time.Minute).Format(time.RFC3339)}}); errRegister != nil {
+			t.Fatalf("Register(soon) error = %v", errRegister)
+		}
+		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{ExpiryPriorityWindow: "5h"}})
+		manager.SetPluginScheduler(&fakePluginScheduler{
+			resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinExpiryPriority},
+			handled: true,
+		})
+
+		got, _, errPick := manager.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext() error = %v", errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickNext() auth = nil")
+		}
+		if got.ID != "soon" {
+			t.Fatalf("expiry-priority pick = %q, want soon", got.ID)
+		}
+	})
 }
 
 func TestManagerPluginSchedulerDelegateRoundRobinUsesNativeMixedRotation(t *testing.T) {
@@ -893,6 +1015,43 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{})
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
+
+	manager.SetSelector(NewExpiryPrioritySelector(2 * time.Hour))
+	if manager.scheduler.strategy != schedulerStrategyExpiry {
+		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyExpiry)
+	}
+	if manager.scheduler.expiryWindow != 2*time.Hour {
+		t.Fatalf("manager.scheduler.expiryWindow = %v, want %v", manager.scheduler.expiryWindow, 2*time.Hour)
+	}
+}
+
+func TestManager_PickNextMixed_UsesSchedulerExpiryPriority(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	manager := NewManager(nil, NewExpiryPrioritySelector(5*time.Hour), nil)
+	manager.executors["gemini"] = schedulerTestExecutor{}
+	manager.executors["claude"] = schedulerTestExecutor{}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(2 * time.Hour).Format(time.RFC3339)}}); errRegister != nil {
+		t.Fatalf("Register(gemini-later) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-soon", Provider: "claude", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}}); errRegister != nil {
+		t.Fatalf("Register(claude-soon) error = %v", errRegister)
+	}
+
+	got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNextMixed() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickNextMixed() auth = nil")
+	}
+	if provider != "claude" {
+		t.Fatalf("pickNextMixed() provider = %q, want %q", provider, "claude")
+	}
+	if got.ID != "claude-soon" {
+		t.Fatalf("pickNextMixed() auth.ID = %q, want %q", got.ID, "claude-soon")
 	}
 }
 

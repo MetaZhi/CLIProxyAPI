@@ -688,6 +688,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.GET("/routing/expiry-priority-window", s.mgmt.GetRoutingExpiryPriorityWindow)
+		mgmt.PUT("/routing/expiry-priority-window", s.mgmt.PutRoutingExpiryPriorityWindow)
+		mgmt.PATCH("/routing/expiry-priority-window", s.mgmt.PutRoutingExpiryPriorityWindow)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
