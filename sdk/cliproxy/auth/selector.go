@@ -27,6 +27,7 @@ const DefaultExpiryPriorityWindowString = "5h"
 var DefaultExpiryPriorityWindow = mustParseExpiryPriorityDefaultWindow()
 
 const DefaultMinimumQuotaPercent = 20.0
+const expiryPriorityScoreMinMinutes = 1.0
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
@@ -44,7 +45,8 @@ type FillFirstSelector struct {
 }
 
 // ExpiryPrioritySelector prioritizes credentials whose expiration is within the configured window.
-// Among expiring credentials, the earliest expiration wins; otherwise selection falls back to round-robin.
+// Among expiring credentials with known quota, the highest quota-per-minute score wins.
+// If no expiring credential has quota data, the earliest expiration wins; otherwise selection falls back to round-robin.
 type ExpiryPrioritySelector struct {
 	Window              time.Duration
 	MinimumQuotaPercent float64
@@ -509,17 +511,47 @@ func authWithinExpiryPriorityWindow(auth *Auth, now time.Time, window time.Durat
 	return expiresAt, true
 }
 
+func expiryPriorityCandidateBefore(candidate *Auth, expiresAt time.Time, picked *Auth, pickedExpiry time.Time) bool {
+	if picked == nil {
+		return true
+	}
+	if expiresAt.Before(pickedExpiry) {
+		return true
+	}
+	return expiresAt.Equal(pickedExpiry) && candidate.ID < picked.ID
+}
+
 func pickExpiryPriorityAuth(auths []*Auth, now time.Time, window time.Duration) (*Auth, bool) {
 	window = normalizeExpiryPriorityWindow(window)
 	var picked *Auth
 	var pickedExpiry time.Time
+	var pickedScore float64
+	pickedHasQuota := false
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
 		expiresAt, ok := authWithinExpiryPriorityWindow(candidate, now, window)
 		if !ok {
 			continue
 		}
-		if picked == nil || expiresAt.Before(pickedExpiry) || (expiresAt.Equal(pickedExpiry) && candidate.ID < picked.ID) {
+		quotaPercent, hasQuota := remainingQuotaPercent(candidate)
+		if hasQuota {
+			remainingMinutes := expiresAt.Sub(now).Minutes()
+			if remainingMinutes < expiryPriorityScoreMinMinutes {
+				remainingMinutes = expiryPriorityScoreMinMinutes
+			}
+			score := quotaPercent / remainingMinutes
+			if !pickedHasQuota || score > pickedScore || (score == pickedScore && expiryPriorityCandidateBefore(candidate, expiresAt, picked, pickedExpiry)) {
+				picked = candidate
+				pickedExpiry = expiresAt
+				pickedScore = score
+				pickedHasQuota = true
+			}
+			continue
+		}
+		if pickedHasQuota {
+			continue
+		}
+		if expiryPriorityCandidateBefore(candidate, expiresAt, picked, pickedExpiry) {
 			picked = candidate
 			pickedExpiry = expiresAt
 		}

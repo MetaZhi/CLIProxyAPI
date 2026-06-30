@@ -248,7 +248,7 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 }
 
-func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindow(t *testing.T) {
+func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindowWhenQuotaUnknown(t *testing.T) {
 	t.Parallel()
 
 	selector := NewExpiryPrioritySelector(5 * time.Hour)
@@ -269,6 +269,119 @@ func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindow(t *testin
 	if got.ID != "soon" {
 		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "soon")
 	}
+}
+
+func TestExpiryPrioritySelectorPick_PrefersHighestQuotaPerMinuteScore(t *testing.T) {
+	t.Parallel()
+
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "soon-low", Metadata: map[string]any{
+			"expires_at":        now.Add(30 * time.Minute).Format(time.RFC3339),
+			"remaining_percent": 20,
+		}},
+		{ID: "later-high", Metadata: map[string]any{
+			"expires_at":        now.Add(2 * time.Hour).Format(time.RFC3339),
+			"remaining_percent": 90,
+		}},
+		{ID: "outside-high", Metadata: map[string]any{
+			"expires_at":        now.Add(8 * time.Hour).Format(time.RFC3339),
+			"remaining_percent": 100,
+		}},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "later-high" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "later-high")
+	}
+}
+
+func TestExpiryPrioritySelectorPick_KnownQuotaBeatsUnknownQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "unknown-soon", Metadata: map[string]any{
+			"expires_at": now.Add(10 * time.Minute).Format(time.RFC3339),
+		}},
+		{ID: "known-later", Metadata: map[string]any{
+			"expires_at":        now.Add(4 * time.Hour).Format(time.RFC3339),
+			"remaining_percent": 1,
+		}},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "known-later" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "known-later")
+	}
+}
+
+func TestPickExpiryPriorityAuth_QuotaScoreTieBreaksByExpiryThenID(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.June, 30, 12, 0, 0, 0, time.UTC)
+
+	t.Run("same score prefers earlier expiry", func(t *testing.T) {
+		auths := []*Auth{
+			{ID: "later", Metadata: map[string]any{
+				"expires_at":        now.Add(30 * time.Minute).Format(time.RFC3339),
+				"remaining_percent": 30,
+			}},
+			{ID: "earlier", Metadata: map[string]any{
+				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
+				"remaining_percent": 20,
+			}},
+		}
+
+		got, ok := pickExpiryPriorityAuth(auths, now, 5*time.Hour)
+		if !ok {
+			t.Fatalf("pickExpiryPriorityAuth() ok = false")
+		}
+		if got == nil {
+			t.Fatalf("pickExpiryPriorityAuth() auth = nil")
+		}
+		if got.ID != "earlier" {
+			t.Fatalf("pickExpiryPriorityAuth() auth.ID = %q, want %q", got.ID, "earlier")
+		}
+	})
+
+	t.Run("same score and expiry prefers lower ID", func(t *testing.T) {
+		auths := []*Auth{
+			{ID: "b", Metadata: map[string]any{
+				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
+				"remaining_percent": 20,
+			}},
+			{ID: "a", Metadata: map[string]any{
+				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
+				"remaining_percent": 20,
+			}},
+		}
+
+		got, ok := pickExpiryPriorityAuth(auths, now, 5*time.Hour)
+		if !ok {
+			t.Fatalf("pickExpiryPriorityAuth() ok = false")
+		}
+		if got == nil {
+			t.Fatalf("pickExpiryPriorityAuth() auth = nil")
+		}
+		if got.ID != "a" {
+			t.Fatalf("pickExpiryPriorityAuth() auth.ID = %q, want %q", got.ID, "a")
+		}
+	})
 }
 
 func TestExpiryPrioritySelectorPick_FallsBackToRoundRobinWhenNoExpiringAuths(t *testing.T) {
