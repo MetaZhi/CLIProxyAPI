@@ -89,6 +89,130 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestRemainingQuotaPercentFromMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		meta map[string]any
+		want float64
+		ok   bool
+	}{
+		{
+			name: "percent number",
+			meta: map[string]any{"remaining_percent": 42.5},
+			want: 42.5,
+			ok:   true,
+		},
+		{
+			name: "percent string",
+			meta: map[string]any{"quota_percent": "20%"},
+			want: 20,
+			ok:   true,
+		},
+		{
+			name: "ratio string",
+			meta: map[string]any{"remaining_ratio": "0.35"},
+			want: 35,
+			ok:   true,
+		},
+		{
+			name: "camel case json number",
+			meta: map[string]any{"remainingQuotaPercent": json.Number("12.75")},
+			want: 12.75,
+			ok:   true,
+		},
+		{
+			name: "nested quota",
+			meta: map[string]any{"quota": map[string]any{"quota_remaining_ratio": 0.6}},
+			want: 60,
+			ok:   true,
+		},
+		{
+			name: "nested usage map string",
+			meta: map[string]any{"usage": map[string]string{"quota_remaining_percent": "88"}},
+			want: 88,
+			ok:   true,
+		},
+		{
+			name: "invalid percent",
+			meta: map[string]any{"remaining_percent": 120},
+			ok:   false,
+		},
+		{
+			name: "invalid ratio",
+			meta: map[string]any{"remaining_ratio": 1.25},
+			ok:   false,
+		},
+		{
+			name: "missing",
+			meta: map[string]any{"tenant": "alpha"},
+			ok:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := remainingQuotaPercent(&Auth{ID: "auth", Metadata: tt.meta})
+			if ok != tt.ok {
+				t.Fatalf("remainingQuotaPercent() ok = %v, want %v", ok, tt.ok)
+			}
+			if ok && got != tt.want {
+				t.Fatalf("remainingQuotaPercent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRoundRobinSelectorPick_MinimumQuotaFiltersLowKnownQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	auths := []*Auth{
+		{ID: "a-low", Metadata: map[string]any{"remaining_percent": 10}},
+		{ID: "b-unknown"},
+		{ID: "c-good", Metadata: map[string]any{"remaining_percent": 50}},
+	}
+
+	want := []string{"b-unknown", "c-good", "b-unknown"}
+	for index, wantID := range want {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestRoundRobinSelectorPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	auths := []*Auth{
+		{ID: "a-low", Metadata: map[string]any{"remaining_percent": 10}},
+		{ID: "b-highest-low", Metadata: map[string]any{"remaining_percent": 15}},
+		{ID: "c-lower", Metadata: map[string]any{"remaining_percent": 5}},
+	}
+
+	for index := 0; index < 3; index++ {
+		got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", index, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", index)
+		}
+		if got.ID != "b-highest-low" {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", index, got.ID, "b-highest-low")
+		}
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 

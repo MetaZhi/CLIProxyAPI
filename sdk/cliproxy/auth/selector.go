@@ -26,23 +26,29 @@ const DefaultExpiryPriorityWindowString = "5h"
 
 var DefaultExpiryPriorityWindow = mustParseExpiryPriorityDefaultWindow()
 
+const DefaultMinimumQuotaPercent = 20.0
+
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
-	mu      sync.Mutex
-	cursors map[string]int
-	maxKeys int
+	mu                  sync.Mutex
+	cursors             map[string]int
+	maxKeys             int
+	MinimumQuotaPercent float64
 }
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+type FillFirstSelector struct {
+	MinimumQuotaPercent float64
+}
 
 // ExpiryPrioritySelector prioritizes credentials whose expiration is within the configured window.
 // Among expiring credentials, the earliest expiration wins; otherwise selection falls back to round-robin.
 type ExpiryPrioritySelector struct {
-	Window     time.Duration
-	roundRobin RoundRobinSelector
+	Window              time.Duration
+	MinimumQuotaPercent float64
+	roundRobin          RoundRobinSelector
 }
 
 type blockReason int
@@ -264,6 +270,200 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
+func MinimumQuotaPercentFromConfig(value *float64) (float64, error) {
+	if value == nil {
+		return DefaultMinimumQuotaPercent, nil
+	}
+	percent := *value
+	if math.IsNaN(percent) || math.IsInf(percent, 0) {
+		return 0, fmt.Errorf("minimum quota percent must be finite")
+	}
+	if percent < 0 || percent > 100 {
+		return 0, fmt.Errorf("minimum quota percent must be between 0 and 100")
+	}
+	return percent, nil
+}
+
+func normalizeMinimumQuotaPercent(percent float64) float64 {
+	if math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 0 || percent > 100 {
+		return DefaultMinimumQuotaPercent
+	}
+	return percent
+}
+
+var quotaPercentKeys = [...]string{"remaining_percent", "quota_percent", "quota_remaining_percent", "remainingQuotaPercent"}
+var quotaRatioKeys = [...]string{"remaining_ratio", "quota_ratio", "quota_remaining_ratio"}
+
+func remainingQuotaPercent(auth *Auth) (float64, bool) {
+	if auth == nil {
+		return 0, false
+	}
+	return remainingQuotaPercentFromMap(auth.Metadata)
+}
+
+func remainingQuotaPercentFromMap(meta map[string]any) (float64, bool) {
+	if meta == nil {
+		return 0, false
+	}
+	if percent, ok := quotaPercentFromMap(meta); ok {
+		return percent, true
+	}
+	for _, nestedKey := range []string{"quota", "usage"} {
+		nested, ok := nestedAnyMap(meta[nestedKey])
+		if !ok {
+			continue
+		}
+		if percent, ok := remainingQuotaPercentFromMap(nested); ok {
+			return percent, true
+		}
+	}
+	return 0, false
+}
+
+func quotaPercentFromMap(meta map[string]any) (float64, bool) {
+	for _, key := range quotaPercentKeys {
+		if value, ok := meta[key]; ok {
+			if percent, ok := parseQuotaFloat(value); ok && percent >= 0 && percent <= 100 {
+				return percent, true
+			}
+		}
+	}
+	for _, key := range quotaRatioKeys {
+		if value, ok := meta[key]; ok {
+			if ratio, ok := parseQuotaFloat(value); ok && ratio >= 0 && ratio <= 1 {
+				return ratio * 100, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func nestedAnyMap(value any) (map[string]any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed, true
+	case map[string]string:
+		out := make(map[string]any, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func parseQuotaFloat(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case string:
+		raw := strings.TrimSpace(strings.TrimSuffix(typed, "%"))
+		if raw == "" {
+			return 0, false
+		}
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, false
+		}
+		return parsed, true
+	case float64:
+		return finiteQuotaFloat(typed)
+	case float32:
+		return finiteQuotaFloat(float64(typed))
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return finiteQuotaFloat(parsed)
+	default:
+		return 0, false
+	}
+}
+
+func finiteQuotaFloat(value float64) (float64, bool) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
+}
+
+func minimumQuotaAllowedAuthIDs(auths []*Auth, threshold float64) map[string]struct{} {
+	threshold = normalizeMinimumQuotaPercent(threshold)
+	if threshold <= 0 || len(auths) == 0 {
+		return nil
+	}
+	eligible := make(map[string]struct{})
+	unknown := make(map[string]struct{})
+	low := make(map[string]float64)
+	maxLow := -1.0
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		percent, ok := remainingQuotaPercent(auth)
+		if !ok {
+			unknown[auth.ID] = struct{}{}
+			continue
+		}
+		if percent >= threshold {
+			eligible[auth.ID] = struct{}{}
+			continue
+		}
+		low[auth.ID] = percent
+		if percent > maxLow {
+			maxLow = percent
+		}
+	}
+	if len(eligible) > 0 {
+		for id := range unknown {
+			eligible[id] = struct{}{}
+		}
+		return eligible
+	}
+	if len(low) == 0 {
+		if len(unknown) > 0 {
+			return unknown
+		}
+		return nil
+	}
+	allowed := make(map[string]struct{})
+	for id := range unknown {
+		allowed[id] = struct{}{}
+	}
+	for id, percent := range low {
+		if percent == maxLow {
+			allowed[id] = struct{}{}
+		}
+	}
+	return allowed
+}
+
+func filterAuthsByMinimumQuota(auths []*Auth, threshold float64) []*Auth {
+	allowed := minimumQuotaAllowedAuthIDs(auths, threshold)
+	if allowed == nil {
+		return auths
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if _, ok := allowed[auth.ID]; ok {
+			out = append(out, auth)
+		}
+	}
+	if len(out) == 0 {
+		return auths
+	}
+	return out
+}
+
 func mustParseExpiryPriorityDefaultWindow() time.Duration {
 	window, err := time.ParseDuration(DefaultExpiryPriorityWindowString)
 	if err != nil {
@@ -336,6 +536,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -373,6 +574,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	return available[0], nil
 }
 
@@ -394,6 +596,7 @@ func (s *ExpiryPrioritySelector) Pick(ctx context.Context, provider, model strin
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	if picked, ok := pickExpiryPriorityAuth(available, now, s.expiryPriorityWindow()); ok {
 		return picked, nil
 	}

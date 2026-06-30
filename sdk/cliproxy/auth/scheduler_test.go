@@ -242,6 +242,123 @@ func TestSchedulerPick_ExpiryPriorityPrefersWebsocketSubset(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_RoundRobinAppliesMinimumQuota(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&Auth{ID: "a-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 10}},
+		&Auth{ID: "b-unknown", Provider: "gemini"},
+		&Auth{ID: "c-good", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 80}},
+	)
+
+	want := []string{"b-unknown", "c-good", "b-unknown"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&Auth{ID: "a-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 10}},
+		&Auth{ID: "b-highest-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 15}},
+		&Auth{ID: "c-lower", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 5}},
+	)
+
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != "b-highest-low" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "b-highest-low")
+		}
+	}
+}
+
+func TestSchedulerPick_MinimumQuotaRespectsPriorityBuckets(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&Auth{ID: "high-low-quota", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{"remaining_percent": 5}},
+		&Auth{ID: "low-good-quota", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{"remaining_percent": 95}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "high-low-quota" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "high-low-quota")
+	}
+}
+
+func TestSchedulerPick_ExpiryPriorityAppliesMinimumQuotaBeforeExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector.MinimumQuotaPercent = 20
+	scheduler := newSchedulerForTest(
+		selector,
+		&Auth{ID: "soon-low", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339), "remaining_percent": 10}},
+		&Auth{ID: "later-good", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(2 * time.Hour).Format(time.RFC3339), "remaining_percent": 80}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "later-good" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "later-good")
+	}
+}
+
+func TestSchedulerPick_WebsocketSubsetAppliesMinimumQuota(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&Auth{ID: "codex-http-good", Provider: "codex", Metadata: map[string]any{"remaining_percent": 90}},
+		&Auth{ID: "codex-ws-lower", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"remaining_percent": 10}},
+		&Auth{ID: "codex-ws-highest-low", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"remaining_percent": 15}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-ws-highest-low" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "codex-ws-highest-low")
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -703,6 +820,34 @@ func TestManagerPluginSchedulerDelegatesBuiltin(t *testing.T) {
 		}
 	})
 
+	t.Run("round-robin with minimum quota", func(t *testing.T) {
+		minimumQuota := 20.0
+		manager := NewManager(nil, &FillFirstSelector{}, nil)
+		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{MinimumQuotaPercent: &minimumQuota}})
+		manager.executors["gemini"] = schedulerTestExecutor{}
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 5}}); errRegister != nil {
+			t.Fatalf("Register(auth-low) error = %v", errRegister)
+		}
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-good", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 80}}); errRegister != nil {
+			t.Fatalf("Register(auth-good) error = %v", errRegister)
+		}
+		manager.SetPluginScheduler(&fakePluginScheduler{
+			resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin},
+			handled: true,
+		})
+
+		got, _, errPick := manager.pickNext(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext() error = %v", errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickNext() auth = nil")
+		}
+		if got.ID != "auth-good" {
+			t.Fatalf("round-robin quota pick = %q, want auth-good", got.ID)
+		}
+	})
+
 	t.Run("round-robin model cursors", func(t *testing.T) {
 		reg := registry.GetGlobalRegistry()
 		models := []*registry.ModelInfo{{ID: "model-a"}, {ID: "model-b"}}
@@ -924,7 +1069,7 @@ func TestManagerPluginSchedulerCandidatesAreSafeCopies(t *testing.T) {
 			"priority":     "7",
 			"team":         "alpha",
 		},
-		Metadata: map[string]any{"tenant": "one"},
+		Metadata: map[string]any{"tenant": "one", "remaining_percent": "42.5"},
 	}
 	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 		t.Fatalf("Register(auth-a) error = %v", errRegister)
@@ -947,6 +1092,12 @@ func TestManagerPluginSchedulerCandidatesAreSafeCopies(t *testing.T) {
 			}
 			if candidate.Attributes["priority"] != "7" {
 				t.Fatalf("scheduler candidate priority attribute = %q, want 7", candidate.Attributes["priority"])
+			}
+			if candidate.RemainingQuotaPercent == nil {
+				t.Fatalf("scheduler candidate RemainingQuotaPercent = nil, want 42.5")
+			}
+			if *candidate.RemainingQuotaPercent != 42.5 {
+				t.Fatalf("scheduler candidate RemainingQuotaPercent = %v, want 42.5", *candidate.RemainingQuotaPercent)
 			}
 			if len(candidate.Metadata) != 0 {
 				t.Fatalf("scheduler candidate Metadata = %#v, want empty", candidate.Metadata)

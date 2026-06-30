@@ -338,6 +338,10 @@ type RoutingConfig struct {
 	// Default: 5h. Accepts duration strings like "2h", "5h", "8h30m".
 	ExpiryPriorityWindow string `yaml:"expiry-priority-window,omitempty" json:"expiry-priority-window,omitempty"`
 
+	// MinimumQuotaPercent skips credentials whose known remaining quota is below this threshold.
+	// Default: 20. Set to 0 to disable quota-aware filtering.
+	MinimumQuotaPercent *float64 `yaml:"minimum-quota-percent,omitempty" json:"minimum-quota-percent,omitempty"`
+
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
 	// metadata.user_id (Claude Code session format), X-Session-ID, Session_id (Codex),

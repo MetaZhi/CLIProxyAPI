@@ -511,9 +511,16 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if m.scheduler != nil {
 		window, err := ParseExpiryPriorityWindow(cfg.Routing.ExpiryPriorityWindow)
 		if err != nil {
+			log.Warnf("invalid routing.expiry-priority-window %q, using default %s: %v", strings.TrimSpace(cfg.Routing.ExpiryPriorityWindow), DefaultExpiryPriorityWindowString, err)
 			window = DefaultExpiryPriorityWindow
 		}
 		m.scheduler.setExpiryPriorityWindow(window)
+		minimumQuotaPercent, err := MinimumQuotaPercentFromConfig(cfg.Routing.MinimumQuotaPercent)
+		if err != nil {
+			log.Warnf("invalid routing.minimum-quota-percent, using default %.0f: %v", DefaultMinimumQuotaPercent, err)
+			minimumQuotaPercent = DefaultMinimumQuotaPercent
+		}
+		m.scheduler.setMinimumQuotaPercent(minimumQuotaPercent)
 	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
@@ -1496,12 +1503,17 @@ func schedulerAuthCandidates(auths []*Auth) []pluginapi.SchedulerAuthCandidate {
 		if auth == nil {
 			continue
 		}
+		var remainingQuota *float64
+		if percent, ok := remainingQuotaPercent(auth); ok {
+			remainingQuota = &percent
+		}
 		out = append(out, pluginapi.SchedulerAuthCandidate{
-			ID:         auth.ID,
-			Provider:   strings.ToLower(strings.TrimSpace(auth.Provider)),
-			Priority:   authPriority(auth),
-			Status:     string(auth.Status),
-			Attributes: schedulerSafeAttributes(auth.Attributes),
+			ID:                    auth.ID,
+			Provider:              strings.ToLower(strings.TrimSpace(auth.Provider)),
+			Priority:              authPriority(auth),
+			Status:                string(auth.Status),
+			Attributes:            schedulerSafeAttributes(auth.Attributes),
+			RemainingQuotaPercent: remainingQuota,
 		})
 	}
 	return out

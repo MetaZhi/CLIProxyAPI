@@ -509,7 +509,9 @@ type SchedulerAuthCandidate struct {
 	Status string
 	// Attributes contains immutable routing and provider attributes.
 	Attributes map[string]string
-	// Metadata contains mutable host-managed auth metadata.
+	// RemainingQuotaPercent is the host-parsed remaining quota percentage when known.
+	RemainingQuotaPercent *float64
+	// Metadata is reserved for future sanitized metadata. The host does not expose raw auth metadata.
 	Metadata map[string]any
 }
 

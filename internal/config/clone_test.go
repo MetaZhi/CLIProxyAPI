@@ -49,12 +49,16 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	if got := clone.Payload.Default[0].Params["object"].(map[string]any)["key"]; got != "value" {
 		t.Fatalf("clone payload object key = %#v, want value", got)
 	}
+	if clone.Routing.MinimumQuotaPercent == nil || *clone.Routing.MinimumQuotaPercent != 20 {
+		t.Fatalf("clone minimum quota percent = %#v, want 20", clone.Routing.MinimumQuotaPercent)
+	}
 
 	clone.APIKeys[0] = "clone-client-key"
 	clone.OAuthExcludedModels["codex"][0] = "clone-hidden-model"
 	clone.OAuthModelAlias["codex"][0].Alias = "clone-client-model"
 	clone.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "clone-low"
 	clone.Payload.Default[0].Params["object"].(map[string]any)["key"] = "clone-value"
+	*clone.Routing.MinimumQuotaPercent = 70
 	plugin := clone.Plugins.Configs["sample"]
 	setPluginRawScalar(t, &plugin.Raw, "mode", "third")
 	clone.Plugins.Configs["sample"] = plugin
@@ -77,6 +81,9 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	if got := cfg.Payload.Default[0].Params["object"].(map[string]any)["key"]; got != "mutated-value" {
 		t.Fatalf("cfg payload object key = %#v, want mutated-value", got)
 	}
+	if cfg.Routing.MinimumQuotaPercent == nil || *cfg.Routing.MinimumQuotaPercent != 35 {
+		t.Fatalf("cfg minimum quota percent = %#v, want 35", cfg.Routing.MinimumQuotaPercent)
+	}
 }
 
 func TestCloneForRuntimeDoesNotShareReferenceFields(t *testing.T) {
@@ -91,6 +98,7 @@ func sampleCloneRuntimeConfig() *Config {
 	bypassStrict := false
 	pluginEnabled := false
 	cacheUserID := true
+	minimumQuotaPercent := 20.0
 
 	return &Config{
 		SDKConfig: SDKConfig{
@@ -171,6 +179,9 @@ func sampleCloneRuntimeConfig() *Config {
 		OAuthModelAlias: map[string][]OAuthModelAlias{
 			"codex": {{Name: "upstream-model", Alias: "client-model", Fork: true}},
 		},
+		Routing: RoutingConfig{
+			MinimumQuotaPercent: &minimumQuotaPercent,
+		},
 		Payload: PayloadConfig{
 			Default: []PayloadRule{{
 				Models: []PayloadModelRule{{
@@ -197,6 +208,7 @@ func mutateOriginalConfig(cfg *Config) {
 	cfg.APIKeys[0] = "mutated-client-key"
 	cfg.OAuthExcludedModels["codex"][0] = "mutated-hidden-model"
 	cfg.OAuthModelAlias["codex"][0].Alias = "mutated-client-model"
+	*cfg.Routing.MinimumQuotaPercent = 35
 	cfg.OpenAICompatibility[0].Models[0].Thinking.Levels[0] = "mutated-low"
 	cfg.Payload.Default[0].Params["object"].(map[string]any)["key"] = "mutated-value"
 	plugin := cfg.Plugins.Configs["sample"]

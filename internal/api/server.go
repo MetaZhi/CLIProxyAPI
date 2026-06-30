@@ -691,6 +691,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/expiry-priority-window", s.mgmt.GetRoutingExpiryPriorityWindow)
 		mgmt.PUT("/routing/expiry-priority-window", s.mgmt.PutRoutingExpiryPriorityWindow)
 		mgmt.PATCH("/routing/expiry-priority-window", s.mgmt.PutRoutingExpiryPriorityWindow)
+		mgmt.GET("/routing/minimum-quota-percent", s.mgmt.GetRoutingMinimumQuotaPercent)
+		mgmt.PUT("/routing/minimum-quota-percent", s.mgmt.PutRoutingMinimumQuotaPercent)
+		mgmt.PATCH("/routing/minimum-quota-percent", s.mgmt.PutRoutingMinimumQuotaPercent)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)

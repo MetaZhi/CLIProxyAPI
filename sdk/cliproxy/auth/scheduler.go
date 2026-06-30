@@ -34,12 +34,13 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	expiryWindow  time.Duration
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu                  sync.Mutex
+	strategy            schedulerStrategy
+	expiryWindow        time.Duration
+	minimumQuotaPercent float64
+	providers           map[string]*providerScheduler
+	authProviders       map[string]string
+	mixedCursors        map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -126,11 +127,12 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		expiryWindow:  selectorExpiryPriorityWindow(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		strategy:            selectorStrategy(selector),
+		expiryWindow:        selectorExpiryPriorityWindow(selector),
+		minimumQuotaPercent: selectorMinimumQuotaPercent(selector),
+		providers:           make(map[string]*providerScheduler),
+		authProviders:       make(map[string]string),
+		mixedCursors:        make(map[string]int),
 	}
 }
 
@@ -157,6 +159,21 @@ func selectorExpiryPriorityWindow(selector Selector) time.Duration {
 	}
 }
 
+func selectorMinimumQuotaPercent(selector Selector) float64 {
+	switch current := selector.(type) {
+	case *RoundRobinSelector:
+		return normalizeMinimumQuotaPercent(current.MinimumQuotaPercent)
+	case *FillFirstSelector:
+		return normalizeMinimumQuotaPercent(current.MinimumQuotaPercent)
+	case *ExpiryPrioritySelector:
+		return normalizeMinimumQuotaPercent(current.MinimumQuotaPercent)
+	case *SessionAffinitySelector:
+		return selectorMinimumQuotaPercent(current.fallback)
+	default:
+		return 0
+	}
+}
+
 // setSelector updates the active built-in strategy and resets mixed-provider cursors.
 func (s *authScheduler) setSelector(selector Selector) {
 	if s == nil {
@@ -166,6 +183,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	s.expiryWindow = selectorExpiryPriorityWindow(selector)
+	s.minimumQuotaPercent = selectorMinimumQuotaPercent(selector)
 	clear(s.mixedCursors)
 }
 
@@ -175,6 +193,15 @@ func (s *authScheduler) setExpiryPriorityWindow(window time.Duration) {
 	}
 	s.mu.Lock()
 	s.expiryWindow = normalizeExpiryPriorityWindow(window)
+	s.mu.Unlock()
+}
+
+func (s *authScheduler) setMinimumQuotaPercent(percent float64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.minimumQuotaPercent = normalizeMinimumQuotaPercent(percent)
 	s.mu.Unlock()
 }
 
@@ -259,7 +286,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, s.expiryWindow, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, s.expiryWindow, s.minimumQuotaPercent, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -328,7 +355,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, strategy, s.expiryWindow, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, s.expiryWindow, s.minimumQuotaPercent, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -361,6 +388,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	if !hasCandidate {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
+	globalPredicate := s.mixedMinimumQuotaPredicateLocked(candidateShards, bestPriority, s.minimumQuotaPercent, predicate)
 
 	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
@@ -368,7 +396,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, s.expiryWindow, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, s.expiryWindow, 0, globalPredicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -385,7 +413,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			candidate, expiresAt := shard.pickExpiringAtPriorityLocked(false, bestPriority, s.expiryWindow, predicate)
+			candidate, expiresAt := shard.pickExpiringAtPriorityLocked(false, bestPriority, s.expiryWindow, 0, globalPredicate)
 			if candidate == nil {
 				continue
 			}
@@ -446,7 +474,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, s.expiryWindow, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, s.expiryWindow, 0, globalPredicate)
 		if picked == nil {
 			continue
 		}
@@ -454,6 +482,20 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+}
+
+func (s *authScheduler) mixedMinimumQuotaPredicateLocked(shards []*modelScheduler, priority int, threshold float64, predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
+	if normalizeMinimumQuotaPercent(threshold) <= 0 {
+		return predicate
+	}
+	entries := make([]*scheduledAuth, 0)
+	for _, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		entries = append(entries, shard.entriesAtPriorityLocked(false, priority)...)
+	}
+	return minimumQuotaScheduledPredicate(entries, threshold, predicate)
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
@@ -779,7 +821,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, expiryWindow time.Duration, minimumQuotaPercent float64, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -788,7 +830,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, expiryWindow, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, expiryWindow, minimumQuotaPercent, predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -824,7 +866,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, expiryWindow time.Duration, minimumQuotaPercent float64, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -836,6 +878,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
 	}
+	predicate = minimumQuotaScheduledPredicate(view.flat, minimumQuotaPercent, predicate)
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
@@ -850,7 +893,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) pickExpiringAtPriorityLocked(preferWebsocket bool, priority int, expiryWindow time.Duration, predicate func(*scheduledAuth) bool) (*Auth, time.Time) {
+func (m *modelScheduler) pickExpiringAtPriorityLocked(preferWebsocket bool, priority int, expiryWindow time.Duration, minimumQuotaPercent float64, predicate func(*scheduledAuth) bool) (*Auth, time.Time) {
 	if m == nil {
 		return nil, time.Time{}
 	}
@@ -862,11 +905,26 @@ func (m *modelScheduler) pickExpiringAtPriorityLocked(preferWebsocket bool, prio
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
 	}
+	predicate = minimumQuotaScheduledPredicate(view.flat, minimumQuotaPercent, predicate)
 	picked, expiresAt := view.firstExpiryPriorityCandidate(time.Now(), expiryWindow, predicate)
 	if picked == nil || picked.auth == nil {
 		return nil, time.Time{}
 	}
 	return picked.auth, expiresAt
+}
+
+func (m *modelScheduler) entriesAtPriorityLocked(preferWebsocket bool, priority int) []*scheduledAuth {
+	if m == nil {
+		return nil
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return nil
+	}
+	if preferWebsocket && len(bucket.ws.flat) > 0 {
+		return bucket.ws.flat
+	}
+	return bucket.all.flat
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
@@ -1082,4 +1140,35 @@ func scheduledAuthWithinExpiryPriorityWindow(entry *scheduledAuth, now time.Time
 		return time.Time{}, false
 	}
 	return authWithinExpiryPriorityWindow(entry.auth, now, window)
+}
+
+func minimumQuotaScheduledPredicate(entries []*scheduledAuth, threshold float64, predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
+	threshold = normalizeMinimumQuotaPercent(threshold)
+	if threshold <= 0 || len(entries) == 0 {
+		return predicate
+	}
+	auths := make([]*Auth, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		auths = append(auths, entry.auth)
+	}
+	allowed := minimumQuotaAllowedAuthIDs(auths, threshold)
+	if allowed == nil {
+		return predicate
+	}
+	return func(entry *scheduledAuth) bool {
+		if predicate != nil && !predicate(entry) {
+			return false
+		}
+		if entry == nil || entry.auth == nil {
+			return false
+		}
+		_, ok := allowed[entry.auth.ID]
+		return ok
+	}
 }

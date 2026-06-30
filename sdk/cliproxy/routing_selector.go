@@ -33,6 +33,20 @@ func routingExpiryPriorityWindow(cfg *config.Config, warnf func(string, ...any))
 	return coreauth.DefaultExpiryPriorityWindow
 }
 
+func routingMinimumQuotaPercent(cfg *config.Config, warnf func(string, ...any)) float64 {
+	if cfg == nil {
+		return coreauth.DefaultMinimumQuotaPercent
+	}
+	percent, err := coreauth.MinimumQuotaPercentFromConfig(cfg.Routing.MinimumQuotaPercent)
+	if err == nil {
+		return percent
+	}
+	if warnf != nil {
+		warnf("invalid routing.minimum-quota-percent, using default %.0f: %v", coreauth.DefaultMinimumQuotaPercent, err)
+	}
+	return coreauth.DefaultMinimumQuotaPercent
+}
+
 func routingSessionAffinityTTL(cfg *config.Config) time.Duration {
 	if cfg == nil {
 		return time.Hour
@@ -50,15 +64,19 @@ func newRoutingSelector(cfg *config.Config, warnf func(string, ...any)) coreauth
 	if cfg != nil {
 		strategy = normalizeRoutingStrategyValue(cfg.Routing.Strategy)
 	}
+	minimumQuotaPercent := routingMinimumQuotaPercent(cfg, warnf)
 
 	var selector coreauth.Selector
 	switch strategy {
 	case "fill-first":
-		selector = &coreauth.FillFirstSelector{}
+		selector = &coreauth.FillFirstSelector{MinimumQuotaPercent: minimumQuotaPercent}
 	case "expiry-priority":
 		selector = coreauth.NewExpiryPrioritySelector(routingExpiryPriorityWindow(cfg, warnf))
+		if expirySelector, ok := selector.(*coreauth.ExpiryPrioritySelector); ok {
+			expirySelector.MinimumQuotaPercent = minimumQuotaPercent
+		}
 	default:
-		selector = &coreauth.RoundRobinSelector{}
+		selector = &coreauth.RoundRobinSelector{MinimumQuotaPercent: minimumQuotaPercent}
 	}
 
 	if cfg != nil && cfg.Routing.SessionAffinity {

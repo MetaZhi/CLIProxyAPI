@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -363,6 +364,40 @@ func (h *Handler) PutRoutingExpiryPriorityWindow(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.ExpiryPriorityWindow = value
+	h.persist(c)
+}
+
+func normalizeMinimumQuotaPercent(value *float64) (float64, bool) {
+	percent, err := coreauth.MinimumQuotaPercentFromConfig(value)
+	if err != nil {
+		return 0, false
+	}
+	return percent, true
+}
+
+// RoutingMinimumQuotaPercent
+func (h *Handler) GetRoutingMinimumQuotaPercent(c *gin.Context) {
+	value, ok := normalizeMinimumQuotaPercent(h.cfg.Routing.MinimumQuotaPercent)
+	if !ok {
+		value = coreauth.DefaultMinimumQuotaPercent
+	}
+	c.JSON(200, gin.H{"minimum-quota-percent": value})
+}
+
+func (h *Handler) PutRoutingMinimumQuotaPercent(c *gin.Context) {
+	var body struct {
+		Value *float64 `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	value := *body.Value
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid minimum-quota-percent"})
+		return
+	}
+	h.cfg.Routing.MinimumQuotaPercent = &value
 	h.persist(c)
 }
 
