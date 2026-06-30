@@ -303,6 +303,122 @@ func TestExpiryPrioritySelectorPick_PrefersHighestQuotaPerMinuteScore(t *testing
 	}
 }
 
+func TestExpiryPrioritySelectorPick_AppliesCodexPlanCapacityMultiplier(t *testing.T) {
+	t.Parallel()
+
+	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	t.Run("prolite beats higher plus percent", func(t *testing.T) {
+		t.Parallel()
+
+		auths := []*Auth{
+			{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, Metadata: map[string]any{
+				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
+				"remaining_percent": 80,
+			}},
+			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, Metadata: map[string]any{
+				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
+				"remaining_percent": 30,
+			}},
+		}
+
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() error = %v", err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() auth = nil")
+		}
+		if got.ID != "prolite" {
+			t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "prolite")
+		}
+	})
+
+	t.Run("pro beats higher prolite percent", func(t *testing.T) {
+		t.Parallel()
+
+		auths := []*Auth{
+			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "pro_lite"}, Metadata: map[string]any{
+				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
+				"remaining_percent": 76,
+			}},
+			{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, Metadata: map[string]any{
+				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
+				"remaining_percent": 20,
+			}},
+		}
+
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() error = %v", err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() auth = nil")
+		}
+		if got.ID != "pro" {
+			t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "pro")
+		}
+	})
+}
+
+func TestQuotaCapacityMultiplier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		auth *Auth
+		want float64
+	}{
+		{
+			name: "codex plus",
+			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}},
+			want: 1,
+		},
+		{
+			name: "codex prolite",
+			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}},
+			want: 5,
+		},
+		{
+			name: "codex pro lite with separator",
+			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "pro-lite"}},
+			want: 5,
+		},
+		{
+			name: "codex pro",
+			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}},
+			want: 20,
+		},
+		{
+			name: "codex unknown",
+			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "team"}},
+			want: 1,
+		},
+		{
+			name: "missing plan",
+			auth: &Auth{Provider: "codex"},
+			want: 1,
+		},
+		{
+			name: "non codex plan",
+			auth: &Auth{Provider: "gemini", Attributes: map[string]string{"plan_type": "pro"}},
+			want: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := quotaCapacityMultiplier(tt.auth)
+			if got != tt.want {
+				t.Fatalf("quotaCapacityMultiplier() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExpiryPrioritySelectorPick_KnownQuotaBeatsUnknownQuota(t *testing.T) {
 	t.Parallel()
 

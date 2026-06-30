@@ -336,6 +336,29 @@ func TestSchedulerPick_ExpiryPriorityAppliesMinimumQuotaBeforeExpiry(t *testing.
 	}
 }
 
+func TestSchedulerPick_ExpiryPriorityAppliesCodexPlanCapacityMultiplier(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewExpiryPrioritySelector(5*time.Hour),
+		&Auth{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 80}},
+		&Auth{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 30}},
+		&Auth{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 20}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "pro" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "pro")
+	}
+}
+
 func TestSchedulerPick_WebsocketSubsetAppliesMinimumQuota(t *testing.T) {
 	t.Parallel()
 

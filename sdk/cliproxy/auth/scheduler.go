@@ -1119,6 +1119,8 @@ func (v *readyView) pickExpiryPriority(now time.Time, window time.Duration, pred
 func (v *readyView) firstExpiryPriorityCandidate(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) (*scheduledAuth, time.Time) {
 	var picked *scheduledAuth
 	var pickedExpiry time.Time
+	var pickedScore float64
+	pickedHasQuota := false
 	for _, entry := range v.flat {
 		if predicate != nil && !predicate(entry) {
 			continue
@@ -1127,12 +1129,37 @@ func (v *readyView) firstExpiryPriorityCandidate(now time.Time, window time.Dura
 		if !ok {
 			continue
 		}
-		if picked == nil || expiresAt.Before(pickedExpiry) || (expiresAt.Equal(pickedExpiry) && entry.auth.ID < picked.auth.ID) {
+		quotaPercent, hasQuota := remainingQuotaPercent(entry.auth)
+		if hasQuota {
+			remainingMinutes := expiresAt.Sub(now).Minutes()
+			if remainingMinutes < expiryPriorityScoreMinMinutes {
+				remainingMinutes = expiryPriorityScoreMinMinutes
+			}
+			score := quotaPercent * quotaCapacityMultiplier(entry.auth) / remainingMinutes
+			if !pickedHasQuota || score > pickedScore || (score == pickedScore && expiryPriorityCandidateBefore(entry.auth, expiresAt, pickedAuth(picked), pickedExpiry)) {
+				picked = entry
+				pickedExpiry = expiresAt
+				pickedScore = score
+				pickedHasQuota = true
+			}
+			continue
+		}
+		if pickedHasQuota {
+			continue
+		}
+		if expiryPriorityCandidateBefore(entry.auth, expiresAt, pickedAuth(picked), pickedExpiry) {
 			picked = entry
 			pickedExpiry = expiresAt
 		}
 	}
 	return picked, pickedExpiry
+}
+
+func pickedAuth(entry *scheduledAuth) *Auth {
+	if entry == nil {
+		return nil
+	}
+	return entry.auth
 }
 
 func scheduledAuthWithinExpiryPriorityWindow(entry *scheduledAuth, now time.Time, window time.Duration) (time.Time, bool) {

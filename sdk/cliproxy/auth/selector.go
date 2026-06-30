@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -45,7 +46,7 @@ type FillFirstSelector struct {
 }
 
 // ExpiryPrioritySelector prioritizes credentials whose expiration is within the configured window.
-// Among expiring credentials with known quota, the highest quota-per-minute score wins.
+// Among expiring credentials with known quota, the highest quota-capacity-per-minute score wins.
 // If no expiring credential has quota data, the earliest expiration wins; otherwise selection falls back to round-robin.
 type ExpiryPrioritySelector struct {
 	Window              time.Duration
@@ -303,6 +304,33 @@ func remainingQuotaPercent(auth *Auth) (float64, bool) {
 	return remainingQuotaPercentFromMap(auth.Metadata)
 }
 
+func quotaCapacityMultiplier(auth *Auth) float64 {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || auth.Attributes == nil {
+		return 1
+	}
+	switch normalizePlanTypeForQuotaMultiplier(auth.Attributes["plan_type"]) {
+	case "prolite":
+		return 5
+	case "pro":
+		return 20
+	default:
+		return 1
+	}
+}
+
+func normalizePlanTypeForQuotaMultiplier(planType string) string {
+	planType = strings.ToLower(strings.TrimSpace(planType))
+	if planType == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return -1
+	}, planType)
+}
+
 func remainingQuotaPercentFromMap(meta map[string]any) (float64, bool) {
 	if meta == nil {
 		return 0, false
@@ -539,7 +567,7 @@ func pickExpiryPriorityAuth(auths []*Auth, now time.Time, window time.Duration) 
 			if remainingMinutes < expiryPriorityScoreMinMinutes {
 				remainingMinutes = expiryPriorityScoreMinMinutes
 			}
-			score := quotaPercent / remainingMinutes
+			score := quotaPercent * quotaCapacityMultiplier(candidate) / remainingMinutes
 			if !pickedHasQuota || score > pickedScore || (score == pickedScore && expiryPriorityCandidateBefore(candidate, expiresAt, picked, pickedExpiry)) {
 				picked = candidate
 				pickedExpiry = expiresAt
