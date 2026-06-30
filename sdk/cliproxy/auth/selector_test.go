@@ -1011,6 +1011,73 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
+func TestSessionAffinitySelector_MinimumQuotaCanReleaseCachedAuth(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "a-sticky", Metadata: map[string]any{"remaining_percent": 50}},
+		{ID: "b-good", Metadata: map[string]any{"remaining_percent": 80}},
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": []string{"quota-session"}}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if first.ID != "a-sticky" {
+		t.Fatalf("first Pick() auth.ID = %q, want %q", first.ID, "a-sticky")
+	}
+
+	auths[0].Metadata["remaining_percent"] = 10
+	second, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() after quota drop error = %v", err)
+	}
+	if second.ID != "b-good" {
+		t.Fatalf("Pick() after quota drop auth.ID = %q, want %q", second.ID, "b-good")
+	}
+}
+
+func TestSessionAffinitySelector_MinimumQuotaAllLowKeepsHighestCachedAuth(t *testing.T) {
+	t.Parallel()
+
+	fallback := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "a-highest-low", Metadata: map[string]any{"remaining_percent": 15}},
+		{ID: "b-lower", Metadata: map[string]any{"remaining_percent": 10}},
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": []string{"quota-low-session"}}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if first.ID != "a-highest-low" {
+		t.Fatalf("first Pick() auth.ID = %q, want %q", first.ID, "a-highest-low")
+	}
+
+	second, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second Pick() auth.ID = %q, want cached %q", second.ID, first.ID)
+	}
+}
+
 func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	t.Parallel()
 

@@ -90,8 +90,8 @@ func TestGetRoutingMinimumQuotaPercent_Default(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if payload["minimum-quota-percent"] != 20 {
-		t.Fatalf("minimum-quota-percent = %v, want 20", payload["minimum-quota-percent"])
+	if payload["minimum-quota-percent"] != 0 {
+		t.Fatalf("minimum-quota-percent = %v, want 0", payload["minimum-quota-percent"])
 	}
 }
 

@@ -27,7 +27,7 @@ const DefaultExpiryPriorityWindowString = "5h"
 
 var DefaultExpiryPriorityWindow = mustParseExpiryPriorityDefaultWindow()
 
-const DefaultMinimumQuotaPercent = 20.0
+const DefaultMinimumQuotaPercent = 0.0
 const expiryPriorityScoreMinMinutes = 1.0
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -270,6 +270,16 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
+	return available, nil
+}
+
+func getSelectableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time, minimumQuotaPercent float64) ([]*Auth, error) {
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = filterAuthsByMinimumQuota(available, minimumQuotaPercent)
 	return available, nil
 }
 
@@ -591,12 +601,10 @@ func pickExpiryPriorityAuth(auths []*Auth, now time.Time, window time.Duration) 
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -629,12 +637,10 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	return available[0], nil
 }
 
@@ -651,12 +657,10 @@ func (s *ExpiryPrioritySelector) expiryPriorityWindow() time.Duration {
 
 func (s *ExpiryPrioritySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent)
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = filterAuthsByMinimumQuota(available, s.MinimumQuotaPercent)
 	if picked, ok := pickExpiryPriorityAuth(available, now, s.expiryPriorityWindow()); ok {
 		return picked, nil
 	}
@@ -784,7 +788,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	now := time.Now()
-	available, err := getAvailableAuths(auths, provider, model, now)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, selectorMinimumQuotaPercent(s.fallback))
 	if err != nil {
 		return nil, err
 	}
@@ -798,13 +802,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				return auth, nil
 			}
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
+		// Cached auth not selectable, reselect via fallback selector for even distribution.
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
 		if err != nil {
 			return nil, err
 		}
 		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		entry.Infof("session-affinity: cache hit but auth not selectable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
 

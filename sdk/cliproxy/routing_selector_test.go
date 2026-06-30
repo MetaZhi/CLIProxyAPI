@@ -58,7 +58,7 @@ func TestNewRoutingSelector_InvalidExpiryWindowFallsBackToDefault(t *testing.T) 
 	}
 }
 
-func TestNewRoutingSelector_MinimumQuotaPercentDefaultsToTwenty(t *testing.T) {
+func TestNewRoutingSelector_MinimumQuotaPercentDefaultsToZero(t *testing.T) {
 	t.Parallel()
 
 	selector := newRoutingSelector(&config.Config{}, nil)
@@ -69,6 +69,9 @@ func TestNewRoutingSelector_MinimumQuotaPercentDefaultsToTwenty(t *testing.T) {
 	}
 	if roundRobin.MinimumQuotaPercent != coreauth.DefaultMinimumQuotaPercent {
 		t.Fatalf("MinimumQuotaPercent = %v, want %v", roundRobin.MinimumQuotaPercent, coreauth.DefaultMinimumQuotaPercent)
+	}
+	if roundRobin.MinimumQuotaPercent != 0 {
+		t.Fatalf("MinimumQuotaPercent = %v, want 0", roundRobin.MinimumQuotaPercent)
 	}
 }
 

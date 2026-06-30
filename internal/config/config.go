@@ -338,8 +338,8 @@ type RoutingConfig struct {
 	// Default: 5h. Accepts duration strings like "2h", "5h", "8h30m".
 	ExpiryPriorityWindow string `yaml:"expiry-priority-window,omitempty" json:"expiry-priority-window,omitempty"`
 
-	// MinimumQuotaPercent skips credentials whose known remaining quota is below this threshold.
-	// Default: 20. Set to 0 to disable quota-aware filtering.
+	// MinimumQuotaPercent softly filters credentials whose known remaining quota is below this threshold.
+	// Default: 0 (disabled). When all known quotas are below the threshold, the highest remaining quota is still allowed.
 	MinimumQuotaPercent *float64 `yaml:"minimum-quota-percent,omitempty" json:"minimum-quota-percent,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
