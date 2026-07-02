@@ -331,12 +331,12 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first", "expiry-priority".
+	// Supported values: "round-robin" (default), "fill-first", "quota-priority".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
-	// ExpiryPriorityWindow defines the expiration window used by the "expiry-priority" strategy.
+	// QuotaPriorityWindow keeps the quota-priority duration setting.
 	// Default: 5h. Accepts duration strings like "2h", "5h", "8h30m".
-	ExpiryPriorityWindow string `yaml:"expiry-priority-window,omitempty" json:"expiry-priority-window,omitempty"`
+	QuotaPriorityWindow string `yaml:"quota-priority-window,omitempty" json:"quota-priority-window,omitempty"`
 
 	// MinimumQuotaPercent softly filters credentials whose known remaining quota is below this threshold.
 	// Default: 0 (disabled). When all known quotas are below the threshold, the highest remaining quota is still allowed.

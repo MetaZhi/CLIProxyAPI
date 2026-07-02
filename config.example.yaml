@@ -167,10 +167,11 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first, expiry-priority
-  # Expiration window used by expiry-priority. Credentials expiring within this window
-  # are preferred, with earlier expiration selected first. Default: 5h
-  expiry-priority-window: "5h"
+  strategy: "round-robin" # round-robin (default), fill-first, quota-priority
+  # Quota-priority ranks metadata.quota_windows by remaining quota percent per
+  # reset minute, and falls back to round-robin when quota window data is missing.
+  # Default: 5h
+  quota-priority-window: "5h"
   # Soft minimum known remaining quota percent before rotating to lower-quota accounts.
   # Set to 0 to disable quota-aware filtering. Default: 0
   minimum-quota-percent: 0

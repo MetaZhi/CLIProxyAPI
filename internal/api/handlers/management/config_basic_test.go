@@ -13,13 +13,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-func TestGetRoutingExpiryPriorityWindow_Default(t *testing.T) {
+func TestGetRoutingQuotaPriorityWindow_Default(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 
 	handler := &Handler{cfg: &config.Config{}}
-	handler.GetRoutingExpiryPriorityWindow(ctx)
+	handler.GetRoutingQuotaPriorityWindow(ctx)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -28,27 +28,27 @@ func TestGetRoutingExpiryPriorityWindow_Default(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if payload["expiry-priority-window"] != "5h" {
-		t.Fatalf("expiry-priority-window = %q, want %q", payload["expiry-priority-window"], "5h")
+	if payload["quota-priority-window"] != "5h" {
+		t.Fatalf("quota-priority-window = %q, want %q", payload["quota-priority-window"], "5h")
 	}
 }
 
-func TestPutRoutingExpiryPriorityWindow_RejectsInvalidDuration(t *testing.T) {
+func TestPutRoutingQuotaPriorityWindow_RejectsInvalidDuration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/expiry-priority-window", bytes.NewBufferString(`{"value":"0"}`))
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/quota-priority-window", bytes.NewBufferString(`{"value":"0"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler := &Handler{cfg: &config.Config{}}
-	handler.PutRoutingExpiryPriorityWindow(ctx)
+	handler.PutRoutingQuotaPriorityWindow(ctx)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
 	}
 }
 
-func TestPutRoutingExpiryPriorityWindow_PersistsValue(t *testing.T) {
+func TestPutRoutingQuotaPriorityWindow_PersistsValue(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -58,20 +58,20 @@ func TestPutRoutingExpiryPriorityWindow_PersistsValue(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/expiry-priority-window", bytes.NewBufferString(`{"value":"6h"}`))
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/quota-priority-window", bytes.NewBufferString(`{"value":"6h"}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler := &Handler{
 		cfg:            &config.Config{},
 		configFilePath: configPath,
 	}
-	handler.PutRoutingExpiryPriorityWindow(ctx)
+	handler.PutRoutingQuotaPriorityWindow(ctx)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if handler.cfg.Routing.ExpiryPriorityWindow != "6h" {
-		t.Fatalf("handler.cfg.Routing.ExpiryPriorityWindow = %q, want %q", handler.cfg.Routing.ExpiryPriorityWindow, "6h")
+	if handler.cfg.Routing.QuotaPriorityWindow != "6h" {
+		t.Fatalf("handler.cfg.Routing.QuotaPriorityWindow = %q, want %q", handler.cfg.Routing.QuotaPriorityWindow, "6h")
 	}
 }
 

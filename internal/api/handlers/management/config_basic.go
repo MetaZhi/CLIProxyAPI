@@ -288,8 +288,8 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 		return "round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
-	case "expiry-priority", "expirypriority", "ep":
-		return "expiry-priority", true
+	case "quota-priority", "quotapriority", "qp":
+		return "quota-priority", true
 	default:
 		return "", false
 	}
@@ -321,32 +321,32 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	h.persist(c)
 }
 
-func normalizeExpiryPriorityWindow(raw string) (string, bool) {
+func normalizeQuotaPriorityWindow(raw string) (string, bool) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
-		return coreauth.DefaultExpiryPriorityWindowString, true
+		return coreauth.DefaultQuotaPriorityWindowString, true
 	}
 	if _, err := time.ParseDuration(value); err != nil {
 		return "", false
 	}
-	duration, err := coreauth.ParseExpiryPriorityWindow(value)
+	duration, err := coreauth.ParseQuotaPriorityWindow(value)
 	if err != nil || duration <= 0 {
 		return "", false
 	}
 	return value, true
 }
 
-// RoutingExpiryPriorityWindow
-func (h *Handler) GetRoutingExpiryPriorityWindow(c *gin.Context) {
-	value, ok := normalizeExpiryPriorityWindow(h.cfg.Routing.ExpiryPriorityWindow)
+// RoutingQuotaPriorityWindow
+func (h *Handler) GetRoutingQuotaPriorityWindow(c *gin.Context) {
+	value, ok := normalizeQuotaPriorityWindow(h.cfg.Routing.QuotaPriorityWindow)
 	if !ok {
-		c.JSON(200, gin.H{"expiry-priority-window": strings.TrimSpace(h.cfg.Routing.ExpiryPriorityWindow)})
+		c.JSON(200, gin.H{"quota-priority-window": strings.TrimSpace(h.cfg.Routing.QuotaPriorityWindow)})
 		return
 	}
-	c.JSON(200, gin.H{"expiry-priority-window": value})
+	c.JSON(200, gin.H{"quota-priority-window": value})
 }
 
-func (h *Handler) PutRoutingExpiryPriorityWindow(c *gin.Context) {
+func (h *Handler) PutRoutingQuotaPriorityWindow(c *gin.Context) {
 	var body struct {
 		Value *string `json:"value"`
 	}
@@ -356,14 +356,14 @@ func (h *Handler) PutRoutingExpiryPriorityWindow(c *gin.Context) {
 	}
 	value := strings.TrimSpace(*body.Value)
 	if value == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expiry-priority-window"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quota-priority-window"})
 		return
 	}
-	if _, errParse := coreauth.ParseExpiryPriorityWindow(value); errParse != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expiry-priority-window"})
+	if _, errParse := coreauth.ParseQuotaPriorityWindow(value); errParse != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quota-priority-window"})
 		return
 	}
-	h.cfg.Routing.ExpiryPriorityWindow = value
+	h.cfg.Routing.QuotaPriorityWindow = value
 	h.persist(c)
 }
 

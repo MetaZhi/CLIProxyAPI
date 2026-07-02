@@ -14,46 +14,46 @@ func routingTestFloat64Ptr(value float64) *float64 {
 	return &value
 }
 
-func TestNewRoutingSelector_UsesExpiryPrioritySelector(t *testing.T) {
+func TestNewRoutingSelector_UsesQuotaPrioritySelector(t *testing.T) {
 	t.Parallel()
 
 	selector := newRoutingSelector(&config.Config{
 		Routing: internalconfig.RoutingConfig{
-			Strategy:             "expiry-priority",
-			ExpiryPriorityWindow: "6h",
+			Strategy:            "quota-priority",
+			QuotaPriorityWindow: "6h",
 		},
 	}, nil)
 
-	expirySelector, ok := selector.(*coreauth.ExpiryPrioritySelector)
+	quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector)
 	if !ok {
-		t.Fatalf("selector = %T, want *coreauth.ExpiryPrioritySelector", selector)
+		t.Fatalf("selector = %T, want *coreauth.QuotaPrioritySelector", selector)
 	}
-	if expirySelector.Window != 6*time.Hour {
-		t.Fatalf("expirySelector.Window = %v, want %v", expirySelector.Window, 6*time.Hour)
+	if quotaSelector.Window != 6*time.Hour {
+		t.Fatalf("quotaSelector.Window = %v, want %v", quotaSelector.Window, 6*time.Hour)
 	}
 }
 
-func TestNewRoutingSelector_InvalidExpiryWindowFallsBackToDefault(t *testing.T) {
+func TestNewRoutingSelector_InvalidQuotaWindowFallsBackToDefault(t *testing.T) {
 	t.Parallel()
 
 	var warnings []string
 	selector := newRoutingSelector(&config.Config{
 		Routing: internalconfig.RoutingConfig{
-			Strategy:             "expiry-priority",
-			ExpiryPriorityWindow: "nope",
+			Strategy:            "quota-priority",
+			QuotaPriorityWindow: "nope",
 		},
 	}, func(format string, args ...any) {
 		warnings = append(warnings, format)
 	})
 
-	expirySelector, ok := selector.(*coreauth.ExpiryPrioritySelector)
+	quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector)
 	if !ok {
-		t.Fatalf("selector = %T, want *coreauth.ExpiryPrioritySelector", selector)
+		t.Fatalf("selector = %T, want *coreauth.QuotaPrioritySelector", selector)
 	}
-	if expirySelector.Window != coreauth.DefaultExpiryPriorityWindow {
-		t.Fatalf("expirySelector.Window = %v, want %v", expirySelector.Window, coreauth.DefaultExpiryPriorityWindow)
+	if quotaSelector.Window != coreauth.DefaultQuotaPriorityWindow {
+		t.Fatalf("quotaSelector.Window = %v, want %v", quotaSelector.Window, coreauth.DefaultQuotaPriorityWindow)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "invalid routing.expiry-priority-window") {
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "invalid routing.quota-priority-window") {
 		t.Fatalf("warnings = %#v, want invalid window warning", warnings)
 	}
 }
@@ -99,19 +99,19 @@ func TestNewRoutingSelector_InvalidMinimumQuotaPercentFallsBackToDefault(t *test
 	var warnings []string
 	selector := newRoutingSelector(&config.Config{
 		Routing: internalconfig.RoutingConfig{
-			Strategy:            "expiry-priority",
+			Strategy:            "quota-priority",
 			MinimumQuotaPercent: routingTestFloat64Ptr(101),
 		},
 	}, func(format string, args ...any) {
 		warnings = append(warnings, format)
 	})
 
-	expirySelector, ok := selector.(*coreauth.ExpiryPrioritySelector)
+	quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector)
 	if !ok {
-		t.Fatalf("selector = %T, want *coreauth.ExpiryPrioritySelector", selector)
+		t.Fatalf("selector = %T, want *coreauth.QuotaPrioritySelector", selector)
 	}
-	if expirySelector.MinimumQuotaPercent != coreauth.DefaultMinimumQuotaPercent {
-		t.Fatalf("MinimumQuotaPercent = %v, want %v", expirySelector.MinimumQuotaPercent, coreauth.DefaultMinimumQuotaPercent)
+	if quotaSelector.MinimumQuotaPercent != coreauth.DefaultMinimumQuotaPercent {
+		t.Fatalf("MinimumQuotaPercent = %v, want %v", quotaSelector.MinimumQuotaPercent, coreauth.DefaultMinimumQuotaPercent)
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "invalid routing.minimum-quota-percent") {
 		t.Fatalf("warnings = %#v, want invalid minimum quota warning", warnings)

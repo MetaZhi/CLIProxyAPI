@@ -456,8 +456,8 @@ const (
 	SchedulerBuiltinRoundRobin = "round-robin"
 	// SchedulerBuiltinFillFirst delegates auth selection to the built-in fill-first scheduler.
 	SchedulerBuiltinFillFirst = "fill-first"
-	// SchedulerBuiltinExpiryPriority delegates auth selection to the built-in expiry-priority scheduler.
-	SchedulerBuiltinExpiryPriority = "expiry-priority"
+	// SchedulerBuiltinQuotaPriority delegates auth selection to the built-in quota-priority scheduler.
+	SchedulerBuiltinQuotaPriority = "quota-priority"
 )
 
 // Scheduler chooses an auth candidate before the built-in scheduler runs.

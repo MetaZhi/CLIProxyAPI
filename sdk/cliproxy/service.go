@@ -1255,14 +1255,14 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 	previousStrategy := ""
 	var previousSessionAffinity bool
 	var previousSessionAffinityTTL string
-	var previousExpiryPriorityWindow string
+	var previousQuotaPriorityWindow string
 	previousMinimumQuotaPercent := routingMinimumQuotaPercent(nil, nil)
 	s.cfgMu.RLock()
 	if s.cfg != nil {
 		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 		previousSessionAffinity = s.cfg.Routing.SessionAffinity
 		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
-		previousExpiryPriorityWindow = strings.TrimSpace(s.cfg.Routing.ExpiryPriorityWindow)
+		previousQuotaPriorityWindow = strings.TrimSpace(s.cfg.Routing.QuotaPriorityWindow)
 		previousMinimumQuotaPercent = routingMinimumQuotaPercent(s.cfg, nil)
 	}
 	s.cfgMu.RUnlock()
@@ -1282,13 +1282,13 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 
 	nextSessionAffinity := newCfg.Routing.SessionAffinity
 	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
-	nextExpiryPriorityWindow := strings.TrimSpace(newCfg.Routing.ExpiryPriorityWindow)
+	nextQuotaPriorityWindow := strings.TrimSpace(newCfg.Routing.QuotaPriorityWindow)
 	nextMinimumQuotaPercent := routingMinimumQuotaPercent(newCfg, nil)
 
 	selectorChanged := previousStrategy != nextStrategy ||
 		previousSessionAffinity != nextSessionAffinity ||
 		previousSessionAffinityTTL != nextSessionAffinityTTL ||
-		previousExpiryPriorityWindow != nextExpiryPriorityWindow ||
+		previousQuotaPriorityWindow != nextQuotaPriorityWindow ||
 		previousMinimumQuotaPercent != nextMinimumQuotaPercent
 
 	if s.coreManager != nil && selectorChanged {

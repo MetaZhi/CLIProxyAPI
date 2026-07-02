@@ -2,11 +2,37 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+type codexQuotaWarmupTestExecutor struct{}
+
+func (codexQuotaWarmupTestExecutor) Identifier() string { return "codex" }
+
+func (codexQuotaWarmupTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (codexQuotaWarmupTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (codexQuotaWarmupTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (codexQuotaWarmupTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (codexQuotaWarmupTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
 
 func TestUpdateAggregatedAvailability_UnavailableWithoutNextRetryDoesNotBlockAuth(t *testing.T) {
 	t.Parallel()
@@ -174,5 +200,102 @@ func TestManager_ResetQuotaClearsRuntimeAndRegistryState(t *testing.T) {
 	}
 	if count := reg.GetModelCount(model); count != 1 {
 		t.Fatalf("registry model count after reset = %d, want 1", count)
+	}
+}
+
+func TestManager_ResetQuotaClearsRuntimeQuotaProbeState(t *testing.T) {
+	manager := NewManager(nil, NewQuotaPrioritySelector(5*time.Hour), nil)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       "codex-runtime-quota",
+		Provider: "codex",
+		Status:   StatusActive,
+		RuntimeMetadata: map[string]any{
+			quotaWindowsMetadataKey: map[string]any{
+				"5h": map[string]any{
+					"remaining_percent": 50,
+					"reset_at":          now.Add(time.Hour).Format(time.RFC3339Nano),
+				},
+			},
+			quotaProbeAfterMetadataKey: now.Add(time.Hour).Format(time.RFC3339Nano),
+		},
+	}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	updated, _, errReset := manager.ResetQuota(ctx, "codex-runtime-quota")
+	if errReset != nil {
+		t.Fatalf("ResetQuota() error = %v", errReset)
+	}
+	if updated == nil {
+		t.Fatalf("ResetQuota() updated auth is nil")
+	}
+	if _, ok := updated.RuntimeMetadata[quotaWindowsMetadataKey]; ok {
+		t.Fatalf("runtime quota windows still present after reset")
+	}
+	if _, ok := updated.RuntimeMetadata[quotaProbeAfterMetadataKey]; ok {
+		t.Fatalf("quota probe guard still present after reset")
+	}
+}
+
+func TestManager_LegacyQuotaWarmupSyncsProbeGuard(t *testing.T) {
+	manager := NewManager(nil, NewQuotaPrioritySelector(5*time.Hour), nil)
+	manager.RegisterExecutor(codexQuotaWarmupTestExecutor{})
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       "known-quota",
+		Provider: "codex",
+		Status:   StatusActive,
+		RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 60, resetIn: time.Hour},
+		}),
+	}); errRegister != nil {
+		t.Fatalf("register known auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(ctx, &Auth{
+		ID:       "unknown-quota",
+		Provider: "codex",
+		Status:   StatusActive,
+	}); errRegister != nil {
+		t.Fatalf("register unknown auth: %v", errRegister)
+	}
+
+	first, _, _, errPick := manager.pickNextMixedLegacy(ctx, []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("first pickNextMixedLegacy() error = %v", errPick)
+	}
+	if first == nil || first.ID != "unknown-quota" {
+		t.Fatalf("first pick auth = %v, want unknown-quota", first)
+	}
+
+	stored, ok := manager.GetByID("unknown-quota")
+	if !ok {
+		t.Fatalf("unknown auth missing after first pick")
+	}
+	if probeAfter, okProbe := quotaProbeAfter(stored); !okProbe || !probeAfter.After(time.Now()) {
+		t.Fatalf("stored quota probe guard = %v ok=%v, want future guard", probeAfter, okProbe)
+	}
+
+	second, _, _, errPick := manager.pickNextMixedLegacy(ctx, []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("second pickNextMixedLegacy() error = %v", errPick)
+	}
+	if second == nil || second.ID != "known-quota" {
+		t.Fatalf("second pick auth = %v, want known-quota", second)
+	}
+
+	scheduled, handled, errScheduled := manager.pickViaBuiltinScheduler(ctx, schedulerStrategyQuota, "mixed", []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+	if errScheduled != nil {
+		t.Fatalf("pickViaBuiltinScheduler() error = %v", errScheduled)
+	}
+	if !handled {
+		t.Fatalf("pickViaBuiltinScheduler() handled = false, want true")
+	}
+	if scheduled == nil || scheduled.ID != "known-quota" {
+		t.Fatalf("scheduled pick auth = %v, want known-quota", scheduled)
 	}
 }

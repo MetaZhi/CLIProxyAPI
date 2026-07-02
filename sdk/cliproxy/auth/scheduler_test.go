@@ -148,15 +148,21 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityPrefersSoonestExpiring(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityPrefersHighestQuotaWindowScore(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	scheduler := newSchedulerForTest(
-		NewExpiryPrioritySelector(5*time.Hour),
-		&Auth{ID: "later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
-		&Auth{ID: "soon", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339)}},
-		&Auth{ID: "outside", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(8 * time.Hour).Format(time.RFC3339)}},
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "later", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 40, resetIn: 4 * time.Hour},
+		})},
+		&Auth{ID: "soon", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 30, resetIn: time.Hour},
+		})},
+		&Auth{ID: "outside", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 95, resetIn: 8 * time.Hour},
+		})},
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
@@ -171,12 +177,68 @@ func TestSchedulerPick_ExpiryPriorityPrefersSoonestExpiring(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityFallsBackToRoundRobin(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityWarmsUnknownCodexQuotaOnce(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	scheduler := newSchedulerForTest(
-		NewExpiryPrioritySelector(5*time.Hour),
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "known", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 80, resetIn: time.Hour},
+		})},
+		&Auth{ID: "unknown", Provider: "codex"},
+	)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("first pickSingle() error = %v", errPick)
+	}
+	if first == nil || first.ID != "unknown" {
+		t.Fatalf("first pickSingle() auth = %v, want unknown", first)
+	}
+
+	second, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("second pickSingle() error = %v", errPick)
+	}
+	if second == nil || second.ID != "known" {
+		t.Fatalf("second pickSingle() auth = %v, want known", second)
+	}
+}
+
+func TestSchedulerPick_QuotaPriorityUsesConfiguredQuotaWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "plus-week-only", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h":   {remainingPercent: 0, resetIn: 4 * time.Hour},
+			"week": {remainingPercent: 90, resetIn: 7 * 24 * time.Hour},
+		})},
+		&Auth{ID: "five-hour", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 20, resetIn: 4 * time.Hour},
+		})},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "five-hour" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "five-hour")
+	}
+}
+
+func TestSchedulerPick_QuotaPriorityFallsBackToRoundRobin(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewQuotaPrioritySelector(5*time.Hour),
 		&Auth{ID: "b", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(8 * time.Hour).Format(time.RFC3339)}},
 		&Auth{ID: "a", Provider: "gemini"},
 		&Auth{ID: "c", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(9 * time.Hour).Format(time.RFC3339)}},
@@ -197,14 +259,18 @@ func TestSchedulerPick_ExpiryPriorityFallsBackToRoundRobin(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityRespectsPriorityBuckets(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityRespectsPriorityBuckets(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	scheduler := newSchedulerForTest(
-		NewExpiryPrioritySelector(5*time.Hour),
-		&Auth{ID: "low-expiring", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}},
-		&Auth{ID: "high-later", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "low-quota", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 90, resetIn: 30 * time.Minute},
+		})},
+		&Auth{ID: "high-later", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 10, resetIn: 4 * time.Hour},
+		})},
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
@@ -219,14 +285,44 @@ func TestSchedulerPick_ExpiryPriorityRespectsPriorityBuckets(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityPrefersWebsocketSubset(t *testing.T) {
+func TestSchedulerPick_QuotaPrioritySkipsExhaustedHigherPriority(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	scheduler := newSchedulerForTest(
-		NewExpiryPrioritySelector(5*time.Hour),
-		&Auth{ID: "codex-http-soon", Provider: "codex", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}},
-		&Auth{ID: "codex-ws-later", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"expires_at": now.Add(90 * time.Minute).Format(time.RFC3339)}},
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "low-available", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 90, resetIn: 30 * time.Minute},
+		})},
+		&Auth{ID: "high-exhausted", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 0, resetIn: 4 * time.Hour},
+		})},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "low-available" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "low-available")
+	}
+}
+
+func TestSchedulerPick_QuotaPriorityPrefersWebsocketSubset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	scheduler := newSchedulerForTest(
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "codex-http-soon", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 90, resetIn: 30 * time.Minute},
+		})},
+		&Auth{ID: "codex-ws-later", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 10, resetIn: 90 * time.Minute},
+		})},
 	)
 
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
@@ -312,16 +408,20 @@ func TestSchedulerPick_MinimumQuotaRespectsPriorityBuckets(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityAppliesMinimumQuotaBeforeExpiry(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityAppliesMinimumQuotaBeforeQuota(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	selector.MinimumQuotaPercent = 20
 	scheduler := newSchedulerForTest(
 		selector,
-		&Auth{ID: "soon-low", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339), "remaining_percent": 10}},
-		&Auth{ID: "later-good", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(2 * time.Hour).Format(time.RFC3339), "remaining_percent": 80}},
+		&Auth{ID: "soon-low", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 10, resetIn: 30 * time.Minute},
+		})},
+		&Auth{ID: "later-good", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 80, resetIn: 2 * time.Hour},
+		})},
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
@@ -336,15 +436,21 @@ func TestSchedulerPick_ExpiryPriorityAppliesMinimumQuotaBeforeExpiry(t *testing.
 	}
 }
 
-func TestSchedulerPick_ExpiryPriorityAppliesCodexPlanCapacityMultiplier(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityAppliesCodexPlanCapacityMultiplier(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	scheduler := newSchedulerForTest(
-		NewExpiryPrioritySelector(5*time.Hour),
-		&Auth{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 80}},
-		&Auth{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 30}},
-		&Auth{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, Metadata: map[string]any{"expires_at": now.Add(1 * time.Hour).Format(time.RFC3339), "remaining_percent": 20}},
+		NewQuotaPrioritySelector(5*time.Hour),
+		&Auth{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 80, resetIn: time.Hour},
+		})},
+		&Auth{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 30, resetIn: time.Hour},
+		})},
+		&Auth{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 20, resetIn: time.Hour},
+		})},
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
@@ -936,19 +1042,23 @@ func TestManagerPluginSchedulerDelegatesBuiltin(t *testing.T) {
 		}
 	})
 
-	t.Run("expiry-priority", func(t *testing.T) {
+	t.Run("quota-priority", func(t *testing.T) {
 		now := time.Now()
 		manager := NewManager(nil, &RoundRobinSelector{}, nil)
 		manager.executors["gemini"] = schedulerTestExecutor{}
-		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}}); errRegister != nil {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "later", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 40, resetIn: 4 * time.Hour},
+		})}); errRegister != nil {
 			t.Fatalf("Register(later) error = %v", errRegister)
 		}
-		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "soon", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(90 * time.Minute).Format(time.RFC3339)}}); errRegister != nil {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "soon", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 30, resetIn: 90 * time.Minute},
+		})}); errRegister != nil {
 			t.Fatalf("Register(soon) error = %v", errRegister)
 		}
-		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{ExpiryPriorityWindow: "5h"}})
+		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{QuotaPriorityWindow: "5h"}})
 		manager.SetPluginScheduler(&fakePluginScheduler{
-			resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinExpiryPriority},
+			resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinQuotaPriority},
 			handled: true,
 		})
 
@@ -960,7 +1070,7 @@ func TestManagerPluginSchedulerDelegatesBuiltin(t *testing.T) {
 			t.Fatalf("pickNext() auth = nil")
 		}
 		if got.ID != "soon" {
-			t.Fatalf("expiry-priority pick = %q, want soon", got.ID)
+			t.Fatalf("quota-priority pick = %q, want soon", got.ID)
 		}
 	})
 }
@@ -1191,26 +1301,30 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
 	}
 
-	manager.SetSelector(NewExpiryPrioritySelector(2 * time.Hour))
-	if manager.scheduler.strategy != schedulerStrategyExpiry {
-		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyExpiry)
+	manager.SetSelector(NewQuotaPrioritySelector(2 * time.Hour))
+	if manager.scheduler.strategy != schedulerStrategyQuota {
+		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyQuota)
 	}
-	if manager.scheduler.expiryWindow != 2*time.Hour {
-		t.Fatalf("manager.scheduler.expiryWindow = %v, want %v", manager.scheduler.expiryWindow, 2*time.Hour)
+	if manager.scheduler.quotaWindow != 2*time.Hour {
+		t.Fatalf("manager.scheduler.quotaWindow = %v, want %v", manager.scheduler.quotaWindow, 2*time.Hour)
 	}
 }
 
-func TestManager_PickNextMixed_UsesSchedulerExpiryPriority(t *testing.T) {
+func TestManager_PickNextMixed_UsesSchedulerQuotaPriority(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	manager := NewManager(nil, NewExpiryPrioritySelector(5*time.Hour), nil)
+	manager := NewManager(nil, NewQuotaPrioritySelector(5*time.Hour), nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-later", Provider: "gemini", Metadata: map[string]any{"expires_at": now.Add(2 * time.Hour).Format(time.RFC3339)}}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-later", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 70, resetIn: 2 * time.Hour},
+	})}); errRegister != nil {
 		t.Fatalf("Register(gemini-later) error = %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-soon", Provider: "claude", Metadata: map[string]any{"expires_at": now.Add(30 * time.Minute).Format(time.RFC3339)}}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-soon", Provider: "claude", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 30, resetIn: 30 * time.Minute},
+	})}); errRegister != nil {
 		t.Fatalf("Register(claude-soon) error = %v", errRegister)
 	}
 

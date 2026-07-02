@@ -166,6 +166,8 @@ type Result struct {
 	Model string
 	// Success marks whether the execution succeeded.
 	Success bool
+	// Headers carries optional upstream response headers for result-side metadata updates.
+	Headers http.Header
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
@@ -313,7 +315,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector, *ExpiryPrioritySelector:
+	case *RoundRobinSelector, *FillFirstSelector, *QuotaPrioritySelector:
 		return true
 	default:
 		return false
@@ -509,12 +511,12 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.runtimeConfig.Store(cfg)
 	if m.scheduler != nil {
-		window, err := ParseExpiryPriorityWindow(cfg.Routing.ExpiryPriorityWindow)
+		window, err := ParseQuotaPriorityWindow(cfg.Routing.QuotaPriorityWindow)
 		if err != nil {
-			log.Warnf("invalid routing.expiry-priority-window %q, using default %s: %v", strings.TrimSpace(cfg.Routing.ExpiryPriorityWindow), DefaultExpiryPriorityWindowString, err)
-			window = DefaultExpiryPriorityWindow
+			log.Warnf("invalid routing.quota-priority-window %q, using default %s: %v", strings.TrimSpace(cfg.Routing.QuotaPriorityWindow), DefaultQuotaPriorityWindowString, err)
+			window = DefaultQuotaPriorityWindow
 		}
-		m.scheduler.setExpiryPriorityWindow(window)
+		m.scheduler.setQuotaPriorityWindow(window)
 		minimumQuotaPercent, err := MinimumQuotaPercentFromConfig(cfg.Routing.MinimumQuotaPercent)
 		if err != nil {
 			log.Warnf("invalid routing.minimum-quota-percent, using default %.0f: %v", DefaultMinimumQuotaPercent, err)
@@ -777,6 +779,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		auth.StatusMessage = ""
 		auth.Status = StatusActive
 	}
+	clearRuntimeQuotaProbeState(auth)
 	auth.UpdatedAt = now
 	if errPersist := m.persist(ctx, auth); errPersist != nil {
 		m.mu.Unlock()
@@ -1368,11 +1371,12 @@ func finishForceMappedStreamChunks(rewriter *StreamRewriter) []byte {
 	return rewriter.Finish()
 }
 
-func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time, selector Selector) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
+	quotaExhaustionWindow, _ := selectorQuotaPriorityExhaustionWindow(selector)
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0
 	var earliest time.Time
@@ -1380,6 +1384,15 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
+			if quotaExhaustionWindow > 0 {
+				if resetAt, exhausted := quotaPriorityWindowExhaustedUntil(candidate, now, quotaExhaustionWindow); exhausted {
+					cooldownCount++
+					if earliest.IsZero() || resetAt.Before(earliest) {
+						earliest = resetAt
+					}
+					continue
+				}
+			}
 			priority := authPriority(candidate)
 			availableByPriority[priority] = append(availableByPriority[priority], candidate)
 			continue
@@ -1496,6 +1509,37 @@ func cloneAuthSlice(auths []*Auth) []*Auth {
 	return out
 }
 
+func (m *Manager) syncSelectedQuotaProbeGuard(selected *Auth) *Auth {
+	if m == nil || selected == nil || selected.RuntimeMetadata == nil {
+		return selected
+	}
+	probeAfter, ok := selected.RuntimeMetadata[quotaProbeAfterMetadataKey]
+	if !ok {
+		return selected
+	}
+
+	var snapshot *Auth
+	var scheduler *authScheduler
+	m.mu.Lock()
+	if current := m.auths[selected.ID]; current != nil {
+		if current.RuntimeMetadata == nil {
+			current.RuntimeMetadata = make(map[string]any)
+		}
+		current.RuntimeMetadata[quotaProbeAfterMetadataKey] = probeAfter
+		snapshot = current.Clone()
+		scheduler = m.scheduler
+	}
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return selected
+	}
+	if scheduler != nil {
+		scheduler.upsertAuth(snapshot)
+	}
+	return snapshot
+}
+
 func schedulerAuthCandidates(auths []*Auth) []pluginapi.SchedulerAuthCandidate {
 	if len(auths) == 0 {
 		return nil
@@ -1568,8 +1612,8 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 		return schedulerStrategyRoundRobin, true
 	case pluginapi.SchedulerBuiltinFillFirst:
 		return schedulerStrategyFillFirst, true
-	case pluginapi.SchedulerBuiltinExpiryPriority:
-		return schedulerStrategyExpiry, true
+	case pluginapi.SchedulerBuiltinQuotaPriority:
+		return schedulerStrategyQuota, true
 	default:
 		return schedulerStrategyCustom, false
 	}
@@ -1610,6 +1654,7 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 			tried[selected.ID] = struct{}{}
 			continue
 		}
+		selected = m.syncSelectedQuotaProbeGuard(selected)
 		return selected, true, nil
 	}
 }
@@ -1833,7 +1878,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Headers: headers})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -2573,6 +2618,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			result.Headers = resp.Headers
 			m.MarkResult(execCtx, result)
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
@@ -3526,6 +3572,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	var quotaSummary codexQuotaUpdateSummary
+	quotaStateChanged := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -3543,6 +3591,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		if result.Success {
+			if strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
+				quotaSummary, quotaStateChanged = updateCodexQuotaFromHeaders(auth, result.Headers, now)
+				if len(quotaSummary.Windows) == 0 {
+					if quotaWindow, okWindow := selectorQuotaPriorityExhaustionWindow(m.selector); okWindow && needsQuotaWarmup(auth, now, quotaWindow) {
+						markQuotaProbeAttempt(auth, now)
+						quotaStateChanged = true
+					}
+				}
+			}
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -3668,7 +3725,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		if !result.Success || !strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
+			_ = m.persist(ctx, auth)
+		}
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -3681,6 +3740,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
+	}
+	if quotaStateChanged {
+		logCodexQuotaUpdate(ctx, result.AuthID, quotaSummary)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -4362,7 +4424,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now(), selector)
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
@@ -4383,6 +4445,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	selected = m.syncSelectedQuotaProbeGuard(selected)
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -4522,7 +4585,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now(), selector)
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
@@ -4543,6 +4606,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	selected = m.syncSelectedQuotaProbeGuard(selected)
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {

@@ -14,6 +14,22 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+type quotaWindowTestSpec struct {
+	remainingPercent float64
+	resetIn          time.Duration
+}
+
+func quotaWindowMetadata(now time.Time, windows map[string]quotaWindowTestSpec) map[string]any {
+	out := make(map[string]any, len(windows))
+	for name, spec := range windows {
+		out[name] = map[string]any{
+			"remaining_percent": spec.remainingPercent,
+			"reset_at":          now.Add(spec.resetIn).Format(time.RFC3339),
+		}
+	}
+	return map[string]any{quotaWindowsMetadataKey: out}
+}
+
 func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	t.Parallel()
 
@@ -92,11 +108,13 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 func TestRemainingQuotaPercentFromMetadata(t *testing.T) {
 	t.Parallel()
 
+	now := time.Now().UTC().Truncate(time.Second)
 	tests := []struct {
-		name string
-		meta map[string]any
-		want float64
-		ok   bool
+		name    string
+		meta    map[string]any
+		runtime map[string]any
+		want    float64
+		ok      bool
 	}{
 		{
 			name: "percent number",
@@ -135,6 +153,15 @@ func TestRemainingQuotaPercentFromMetadata(t *testing.T) {
 			ok:   true,
 		},
 		{
+			name: "quota windows highest unexpired",
+			runtime: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h":   {remainingPercent: 42.5, resetIn: 5 * time.Hour},
+				"week": {remainingPercent: 80, resetIn: 7 * 24 * time.Hour},
+			}),
+			want: 80,
+			ok:   true,
+		},
+		{
 			name: "invalid percent",
 			meta: map[string]any{"remaining_percent": 120},
 			ok:   false,
@@ -153,7 +180,7 @@ func TestRemainingQuotaPercentFromMetadata(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := remainingQuotaPercent(&Auth{ID: "auth", Metadata: tt.meta})
+			got, ok := remainingQuotaPercent(&Auth{ID: "auth", Metadata: tt.meta, RuntimeMetadata: tt.runtime})
 			if ok != tt.ok {
 				t.Fatalf("remainingQuotaPercent() ok = %v, want %v", ok, tt.ok)
 			}
@@ -248,10 +275,10 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 }
 
-func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindowWhenQuotaUnknown(t *testing.T) {
+func TestQuotaPrioritySelectorPick_FallsBackToRoundRobinWhenQuotaWindowsUnknown(t *testing.T) {
 	t.Parallel()
 
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now()
 	auths := []*Auth{
 		{ID: "late", Metadata: map[string]any{"expires_at": now.Add(4 * time.Hour).Format(time.RFC3339)}},
@@ -266,29 +293,26 @@ func TestExpiryPrioritySelectorPick_PrefersSoonestExpiringWithinWindowWhenQuotaU
 	if got == nil {
 		t.Fatalf("Pick() auth = nil")
 	}
-	if got.ID != "soon" {
-		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "soon")
+	if got.ID != "late" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "late")
 	}
 }
 
-func TestExpiryPrioritySelectorPick_PrefersHighestQuotaPerMinuteScore(t *testing.T) {
+func TestQuotaPrioritySelectorPick_PrefersHighestQuotaPerMinuteScore(t *testing.T) {
 	t.Parallel()
 
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
-		{ID: "soon-low", Metadata: map[string]any{
-			"expires_at":        now.Add(30 * time.Minute).Format(time.RFC3339),
-			"remaining_percent": 20,
-		}},
-		{ID: "later-high", Metadata: map[string]any{
-			"expires_at":        now.Add(2 * time.Hour).Format(time.RFC3339),
-			"remaining_percent": 90,
-		}},
-		{ID: "outside-high", Metadata: map[string]any{
-			"expires_at":        now.Add(8 * time.Hour).Format(time.RFC3339),
-			"remaining_percent": 100,
-		}},
+		{ID: "soon-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 20, resetIn: 30 * time.Minute},
+		})},
+		{ID: "later-high", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 90, resetIn: 2 * time.Hour},
+		})},
+		{ID: "outside-high", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 100, resetIn: 8 * time.Hour},
+		})},
 	}
 
 	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
@@ -303,24 +327,125 @@ func TestExpiryPrioritySelectorPick_PrefersHighestQuotaPerMinuteScore(t *testing
 	}
 }
 
-func TestExpiryPrioritySelectorPick_AppliesCodexPlanCapacityMultiplier(t *testing.T) {
+func TestQuotaPrioritySelectorPick_IgnoresPersistedQuotaWindows(t *testing.T) {
 	t.Parallel()
 
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "a"},
+		{ID: "b", Metadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 100, resetIn: 30 * time.Minute},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "a" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "a")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_UsesConfiguredQuotaWindow(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "plus-week-only", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h":   {remainingPercent: 0, resetIn: 4 * time.Hour},
+			"week": {remainingPercent: 90, resetIn: 7 * 24 * time.Hour},
+		})},
+		{ID: "five-hour", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 20, resetIn: 4 * time.Hour},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "five-hour" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "five-hour")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_ExhaustedWindowSkipsHigherPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "high-exhausted", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 0, resetIn: 4 * time.Hour},
+		})},
+		{ID: "low-available", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 20, resetIn: 4 * time.Hour},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "low-available" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low-available")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_NonExhaustedWindowKeepsHigherPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "high-available", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 1, resetIn: 4 * time.Hour},
+		})},
+		{ID: "low-better", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 90, resetIn: time.Hour},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "high-available" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "high-available")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_AppliesCodexPlanCapacityMultiplier(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now().UTC().Truncate(time.Second)
 
 	t.Run("prolite beats higher plus percent", func(t *testing.T) {
 		t.Parallel()
 
 		auths := []*Auth{
-			{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, Metadata: map[string]any{
-				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
-				"remaining_percent": 80,
-			}},
-			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, Metadata: map[string]any{
-				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
-				"remaining_percent": 30,
-			}},
+			{ID: "plus", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 80, resetIn: time.Hour},
+			})},
+			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 30, resetIn: time.Hour},
+			})},
 		}
 
 		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
@@ -339,14 +464,12 @@ func TestExpiryPrioritySelectorPick_AppliesCodexPlanCapacityMultiplier(t *testin
 		t.Parallel()
 
 		auths := []*Auth{
-			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "pro_lite"}, Metadata: map[string]any{
-				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
-				"remaining_percent": 76,
-			}},
-			{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, Metadata: map[string]any{
-				"expires_at":        now.Add(1 * time.Hour).Format(time.RFC3339),
-				"remaining_percent": 20,
-			}},
+			{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "pro_lite"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 76, resetIn: time.Hour},
+			})},
+			{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 20, resetIn: time.Hour},
+			})},
 		}
 
 		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
@@ -391,6 +514,15 @@ func TestQuotaCapacityMultiplier(t *testing.T) {
 			want: 20,
 		},
 		{
+			name: "runtime plan overrides attributes",
+			auth: &Auth{
+				Provider:        "codex",
+				Attributes:      map[string]string{"plan_type": "plus"},
+				RuntimeMetadata: map[string]any{"plan_type": "pro"},
+			},
+			want: 20,
+		},
+		{
 			name: "codex unknown",
 			auth: &Auth{Provider: "codex", Attributes: map[string]string{"plan_type": "team"}},
 			want: 1,
@@ -419,19 +551,18 @@ func TestQuotaCapacityMultiplier(t *testing.T) {
 	}
 }
 
-func TestExpiryPrioritySelectorPick_KnownQuotaBeatsUnknownQuota(t *testing.T) {
+func TestQuotaPrioritySelectorPick_KnownQuotaBeatsUnknownQuota(t *testing.T) {
 	t.Parallel()
 
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
 		{ID: "unknown-soon", Metadata: map[string]any{
 			"expires_at": now.Add(10 * time.Minute).Format(time.RFC3339),
 		}},
-		{ID: "known-later", Metadata: map[string]any{
-			"expires_at":        now.Add(4 * time.Hour).Format(time.RFC3339),
-			"remaining_percent": 1,
-		}},
+		{ID: "known-later", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 1, resetIn: 4 * time.Hour},
+		})},
 	}
 
 	got, err := selector.Pick(context.Background(), "gemini", "", cliproxyexecutor.Options{}, auths)
@@ -446,64 +577,112 @@ func TestExpiryPrioritySelectorPick_KnownQuotaBeatsUnknownQuota(t *testing.T) {
 	}
 }
 
-func TestPickExpiryPriorityAuth_QuotaScoreTieBreaksByExpiryThenID(t *testing.T) {
+func TestQuotaPrioritySelectorPick_WarmsUnknownCodexQuotaOnce(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	known := &Auth{ID: "known", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 80, resetIn: time.Hour},
+	})}
+	unknown := &Auth{ID: "unknown", Provider: "codex"}
+	auths := []*Auth{known, unknown}
+
+	first, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first == nil || first.ID != "unknown" {
+		t.Fatalf("first Pick() auth = %v, want unknown", first)
+	}
+	if probeAfter, ok := quotaProbeAfter(unknown); !ok || !probeAfter.After(now) {
+		t.Fatalf("unknown quota probe_after = %v ok=%v, want future", probeAfter, ok)
+	}
+
+	second, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second == nil || second.ID != "known" {
+		t.Fatalf("second Pick() auth = %v, want known", second)
+	}
+}
+
+func TestQuotaPrioritySelectorPick_DoesNotWarmExhaustedWindowBeforeReset(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	exhausted := &Auth{ID: "exhausted", Provider: "codex", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 0, resetIn: time.Hour},
+	})}
+	available := &Auth{ID: "available", Provider: "codex", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 20, resetIn: time.Hour},
+	})}
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{exhausted, available})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "available" {
+		t.Fatalf("Pick() auth = %v, want available", got)
+	}
+}
+
+func TestPickQuotaPriorityAuth_QuotaScoreTieBreaksByResetThenID(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.June, 30, 12, 0, 0, 0, time.UTC)
 
-	t.Run("same score prefers earlier expiry", func(t *testing.T) {
+	t.Run("same score prefers earlier reset", func(t *testing.T) {
 		auths := []*Auth{
-			{ID: "later", Metadata: map[string]any{
-				"expires_at":        now.Add(30 * time.Minute).Format(time.RFC3339),
-				"remaining_percent": 30,
-			}},
-			{ID: "earlier", Metadata: map[string]any{
-				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
-				"remaining_percent": 20,
-			}},
+			{ID: "later", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 30, resetIn: 30 * time.Minute},
+			})},
+			{ID: "earlier", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 20, resetIn: 20 * time.Minute},
+			})},
 		}
 
-		got, ok := pickExpiryPriorityAuth(auths, now, 5*time.Hour)
+		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour)
 		if !ok {
-			t.Fatalf("pickExpiryPriorityAuth() ok = false")
+			t.Fatalf("pickQuotaPriorityAuth() ok = false")
 		}
 		if got == nil {
-			t.Fatalf("pickExpiryPriorityAuth() auth = nil")
+			t.Fatalf("pickQuotaPriorityAuth() auth = nil")
 		}
 		if got.ID != "earlier" {
-			t.Fatalf("pickExpiryPriorityAuth() auth.ID = %q, want %q", got.ID, "earlier")
+			t.Fatalf("pickQuotaPriorityAuth() auth.ID = %q, want %q", got.ID, "earlier")
 		}
 	})
 
-	t.Run("same score and expiry prefers lower ID", func(t *testing.T) {
+	t.Run("same score and reset prefers lower ID", func(t *testing.T) {
 		auths := []*Auth{
-			{ID: "b", Metadata: map[string]any{
-				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
-				"remaining_percent": 20,
-			}},
-			{ID: "a", Metadata: map[string]any{
-				"expires_at":        now.Add(20 * time.Minute).Format(time.RFC3339),
-				"remaining_percent": 20,
-			}},
+			{ID: "b", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 20, resetIn: 20 * time.Minute},
+			})},
+			{ID: "a", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+				"5h": {remainingPercent: 20, resetIn: 20 * time.Minute},
+			})},
 		}
 
-		got, ok := pickExpiryPriorityAuth(auths, now, 5*time.Hour)
+		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour)
 		if !ok {
-			t.Fatalf("pickExpiryPriorityAuth() ok = false")
+			t.Fatalf("pickQuotaPriorityAuth() ok = false")
 		}
 		if got == nil {
-			t.Fatalf("pickExpiryPriorityAuth() auth = nil")
+			t.Fatalf("pickQuotaPriorityAuth() auth = nil")
 		}
 		if got.ID != "a" {
-			t.Fatalf("pickExpiryPriorityAuth() auth.ID = %q, want %q", got.ID, "a")
+			t.Fatalf("pickQuotaPriorityAuth() auth.ID = %q, want %q", got.ID, "a")
 		}
 	})
 }
 
-func TestExpiryPrioritySelectorPick_FallsBackToRoundRobinWhenNoExpiringAuths(t *testing.T) {
+func TestQuotaPrioritySelectorPick_FallsBackToRoundRobinWhenNoQuotaWindows(t *testing.T) {
 	t.Parallel()
 
-	selector := NewExpiryPrioritySelector(5 * time.Hour)
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now()
 	auths := []*Auth{
 		{ID: "b", Metadata: map[string]any{"expires_at": now.Add(7 * time.Hour).Format(time.RFC3339)}},
@@ -1075,6 +1254,83 @@ func TestSessionAffinitySelector_MinimumQuotaAllLowKeepsHighestCachedAuth(t *tes
 	}
 	if second.ID != first.ID {
 		t.Fatalf("second Pick() auth.ID = %q, want cached %q", second.ID, first.ID)
+	}
+}
+
+func TestSessionAffinitySelector_QuotaPriorityReleasesExhaustedCachedAuth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	fallback := NewQuotaPrioritySelector(5 * time.Hour)
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "high-sticky", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 40, resetIn: 4 * time.Hour},
+		})},
+		{ID: "low-available", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 80, resetIn: 4 * time.Hour},
+		})},
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": []string{"quota-window-session"}}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if first.ID != "high-sticky" {
+		t.Fatalf("first Pick() auth.ID = %q, want %q", first.ID, "high-sticky")
+	}
+
+	auths[0].RuntimeMetadata = quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		"5h": {remainingPercent: 0, resetIn: 4 * time.Hour},
+	})
+	second, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("Pick() after quota exhausted error = %v", err)
+	}
+	if second.ID != "low-available" {
+		t.Fatalf("Pick() after quota exhausted auth.ID = %q, want %q", second.ID, "low-available")
+	}
+}
+
+func TestSessionAffinitySelector_QuotaWarmupDoesNotBindSession(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	fallback := NewQuotaPrioritySelector(5 * time.Hour)
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{
+		{ID: "a-unknown", Provider: "codex", Status: StatusActive},
+		{ID: "b-known", Provider: "codex", Status: StatusActive, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 60, resetIn: time.Hour},
+		})},
+	}
+	opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": []string{"quota-warmup-session"}}}
+
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("first Pick() error = %v", err)
+	}
+	if first.ID != "a-unknown" {
+		t.Fatalf("first Pick() auth.ID = %q, want %q", first.ID, "a-unknown")
+	}
+
+	second, err := selector.Pick(context.Background(), "codex", "gpt-5-codex", opts, auths)
+	if err != nil {
+		t.Fatalf("second Pick() error = %v", err)
+	}
+	if second.ID != "b-known" {
+		t.Fatalf("second Pick() auth.ID = %q, want %q", second.ID, "b-known")
 	}
 }
 

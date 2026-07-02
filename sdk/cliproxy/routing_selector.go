@@ -12,25 +12,25 @@ func normalizeRoutingStrategyValue(strategy string) string {
 	switch strings.ToLower(strings.TrimSpace(strategy)) {
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first"
-	case "expiry-priority", "expirypriority", "ep":
-		return "expiry-priority"
+	case "quota-priority", "quotapriority", "qp":
+		return "quota-priority"
 	default:
 		return "round-robin"
 	}
 }
 
-func routingExpiryPriorityWindow(cfg *config.Config, warnf func(string, ...any)) time.Duration {
+func routingQuotaPriorityWindow(cfg *config.Config, warnf func(string, ...any)) time.Duration {
 	if cfg == nil {
-		return coreauth.DefaultExpiryPriorityWindow
+		return coreauth.DefaultQuotaPriorityWindow
 	}
-	window, err := coreauth.ParseExpiryPriorityWindow(cfg.Routing.ExpiryPriorityWindow)
+	window, err := coreauth.ParseQuotaPriorityWindow(cfg.Routing.QuotaPriorityWindow)
 	if err == nil {
 		return window
 	}
 	if warnf != nil {
-		warnf("invalid routing.expiry-priority-window %q, using default %s: %v", strings.TrimSpace(cfg.Routing.ExpiryPriorityWindow), coreauth.DefaultExpiryPriorityWindowString, err)
+		warnf("invalid routing.quota-priority-window %q, using default %s: %v", strings.TrimSpace(cfg.Routing.QuotaPriorityWindow), coreauth.DefaultQuotaPriorityWindowString, err)
 	}
-	return coreauth.DefaultExpiryPriorityWindow
+	return coreauth.DefaultQuotaPriorityWindow
 }
 
 func routingMinimumQuotaPercent(cfg *config.Config, warnf func(string, ...any)) float64 {
@@ -70,10 +70,10 @@ func newRoutingSelector(cfg *config.Config, warnf func(string, ...any)) coreauth
 	switch strategy {
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{MinimumQuotaPercent: minimumQuotaPercent}
-	case "expiry-priority":
-		selector = coreauth.NewExpiryPrioritySelector(routingExpiryPriorityWindow(cfg, warnf))
-		if expirySelector, ok := selector.(*coreauth.ExpiryPrioritySelector); ok {
-			expirySelector.MinimumQuotaPercent = minimumQuotaPercent
+	case "quota-priority":
+		selector = coreauth.NewQuotaPrioritySelector(routingQuotaPriorityWindow(cfg, warnf))
+		if quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector); ok {
+			quotaSelector.MinimumQuotaPercent = minimumQuotaPercent
 		}
 	default:
 		selector = &coreauth.RoundRobinSelector{MinimumQuotaPercent: minimumQuotaPercent}

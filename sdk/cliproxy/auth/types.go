@@ -73,6 +73,8 @@ type Auth struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
 	Metadata map[string]any `json:"metadata,omitempty"`
+	// RuntimeMetadata stores observed runtime state that should not be persisted.
+	RuntimeMetadata map[string]any `json:"-"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
 	// LastError stores the last failure encountered while executing or refreshing.
@@ -274,6 +276,16 @@ func (a *Auth) Clone() *Auth {
 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
 		for key, value := range a.Metadata {
 			copyAuth.Metadata[key] = value
+		}
+	}
+	if len(a.RuntimeMetadata) > 0 {
+		copyAuth.RuntimeMetadata = make(map[string]any, len(a.RuntimeMetadata))
+		for key, value := range a.RuntimeMetadata {
+			if key == quotaWindowsMetadataKey {
+				copyAuth.RuntimeMetadata[key] = cloneQuotaWindowsMetadata(value)
+				continue
+			}
+			copyAuth.RuntimeMetadata[key] = value
 		}
 	}
 	if len(a.ModelStates) > 0 {
