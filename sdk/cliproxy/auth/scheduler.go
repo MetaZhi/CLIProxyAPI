@@ -476,7 +476,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			}
 			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
 			entry.Infof("routing scheduler: selected | provider=mixed selected_provider=%s model=%s strategy=%s reason=quota-warmup auth=%s priority=%d minimum_quota_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s",
-				providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, s.minimumQuotaPercent, winningWindow, resetIn, quota, score, multiplier, quotaWarmupProbeCooldown)
+				providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, s.minimumQuotaPercent, winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown)
 			return picked, providerKey, nil
 		}
 

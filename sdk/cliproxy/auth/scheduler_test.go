@@ -196,6 +196,13 @@ func TestSchedulerPick_QuotaPriorityWarmsUnknownCodexQuotaOnce(t *testing.T) {
 	if first == nil || first.ID != "unknown" {
 		t.Fatalf("first pickSingle() auth = %v, want unknown", first)
 	}
+	probeAfter, okProbe := quotaProbeAfter(first)
+	if !okProbe {
+		t.Fatalf("quotaProbeAfter(first) ok = false, want true")
+	}
+	if until := probeAfter.Sub(time.Now()); until <= 0 || until > quotaWarmupInFlightCooldown+5*time.Second {
+		t.Fatalf("quota probe cooldown = %s, want about %s", until, quotaWarmupInFlightCooldown)
+	}
 
 	second, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
 	if errPick != nil {

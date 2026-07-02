@@ -29,7 +29,8 @@ var DefaultQuotaPriorityWindow = mustParseQuotaPriorityDefaultWindow()
 
 const DefaultMinimumQuotaPercent = 0.0
 const quotaPriorityScoreMinMinutes = 1.0
-const quotaWarmupProbeCooldown = 30 * time.Minute
+const quotaWarmupInFlightCooldown = 2 * time.Minute
+const quotaWarmupMissingHeadersCooldown = time.Minute
 const selectionCandidateLogLimit = 12
 const quotaWindowsMetadataKey = "quota_windows"
 const quotaProbeAfterMetadataKey = "quota_probe_after"
@@ -275,14 +276,25 @@ func quotaProbeCoolingDown(auth *Auth, now time.Time) bool {
 	return ok && probeAfter.After(now)
 }
 
-func markQuotaProbeAttempt(auth *Auth, now time.Time) {
+func markQuotaProbeCooldown(auth *Auth, now time.Time, cooldown time.Duration) {
 	if auth == nil {
 		return
+	}
+	if cooldown <= 0 {
+		cooldown = quotaWarmupInFlightCooldown
 	}
 	if auth.RuntimeMetadata == nil {
 		auth.RuntimeMetadata = make(map[string]any)
 	}
-	auth.RuntimeMetadata[quotaProbeAfterMetadataKey] = now.Add(quotaWarmupProbeCooldown).UTC().Format(time.RFC3339Nano)
+	auth.RuntimeMetadata[quotaProbeAfterMetadataKey] = now.Add(cooldown).UTC().Format(time.RFC3339Nano)
+}
+
+func markQuotaProbeAttempt(auth *Auth, now time.Time) {
+	markQuotaProbeCooldown(auth, now, quotaWarmupInFlightCooldown)
+}
+
+func markQuotaProbeMissingHeaders(auth *Auth, now time.Time) {
+	markQuotaProbeCooldown(auth, now, quotaWarmupMissingHeadersCooldown)
 }
 
 func clearQuotaProbeGuard(auth *Auth) bool {
@@ -312,6 +324,13 @@ func clearRuntimeQuotaProbeState(auth *Auth) bool {
 
 func needsQuotaWarmup(auth *Auth, now time.Time, window time.Duration) bool {
 	if !isCodexAuth(auth) || quotaProbeCoolingDown(auth, now) {
+		return false
+	}
+	return lacksQuotaWindowScore(auth, now, window)
+}
+
+func lacksQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) bool {
+	if !isCodexAuth(auth) {
 		return false
 	}
 	_, ok := bestQuotaWindowScore(auth, now, window)
@@ -1092,7 +1111,7 @@ func (s *QuotaPrioritySelector) Pick(ctx context.Context, provider, model string
 	if picked, ok := pickQuotaWarmupAuth(available, now, quotaWindow); ok {
 		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow)
 		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-warmup auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s minimum_quota_percent=%.2f",
-			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, quotaWarmupProbeCooldown, normalizeMinimumQuotaPercent(s.MinimumQuotaPercent))
+			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown, normalizeMinimumQuotaPercent(s.MinimumQuotaPercent))
 		return picked, nil
 	}
 	if picked, ok := pickQuotaPriorityAuth(available, now, quotaWindow); ok {

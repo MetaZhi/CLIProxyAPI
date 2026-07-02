@@ -3775,6 +3775,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	cooldownStateChanged := false
 	var quotaSummary codexQuotaUpdateSummary
 	quotaStateChanged := false
+	quotaWarmupMissingHeaders := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -3795,9 +3796,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
 				quotaSummary, quotaStateChanged = updateCodexQuotaFromHeaders(auth, result.Headers, now)
 				if len(quotaSummary.Windows) == 0 {
-					if quotaWindow, okWindow := selectorQuotaPriorityExhaustionWindow(m.selector); okWindow && needsQuotaWarmup(auth, now, quotaWindow) {
-						markQuotaProbeAttempt(auth, now)
+					if quotaWindow, okWindow := selectorQuotaPriorityExhaustionWindow(m.selector); okWindow && lacksQuotaWindowScore(auth, now, quotaWindow) {
+						markQuotaProbeMissingHeaders(auth, now)
 						quotaStateChanged = true
+						quotaWarmupMissingHeaders = true
 					}
 				}
 			}
@@ -3944,6 +3946,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if quotaStateChanged {
 		logCodexQuotaUpdate(ctx, result.AuthID, quotaSummary)
+	}
+	if quotaWarmupMissingHeaders {
+		logEntryWithRequestID(ctx).WithField("auth", result.AuthID).Infof("codex quota warmup missing quota headers | provider=%s model=%s retry_after=%s",
+			result.Provider, result.Model, quotaWarmupMissingHeadersCooldown)
 	}
 
 	if clearModelQuota && result.Model != "" {

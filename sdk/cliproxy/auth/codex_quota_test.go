@@ -232,8 +232,12 @@ func TestMarkResultCodexSuccessWithoutQuotaHeadersSetsProbeGuard(t *testing.T) {
 	if !ok || updated == nil {
 		t.Fatalf("GetByID() ok=%v auth=%v, want auth", ok, updated)
 	}
-	if probeAfter, okProbe := quotaProbeAfter(updated); !okProbe || !probeAfter.After(time.Now()) {
+	probeAfter, okProbe := quotaProbeAfter(updated)
+	if !okProbe || !probeAfter.After(time.Now()) {
 		t.Fatalf("quota probe_after = %v ok=%v, want future", probeAfter, okProbe)
+	}
+	if until := probeAfter.Sub(time.Now()); until <= 0 || until > quotaWarmupMissingHeadersCooldown+5*time.Second {
+		t.Fatalf("quota probe cooldown = %s, want about %s", until, quotaWarmupMissingHeadersCooldown)
 	}
 }
 
