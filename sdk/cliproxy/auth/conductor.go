@@ -3766,6 +3766,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		return
 	}
 
+	isCodexResult := strings.EqualFold(strings.TrimSpace(result.Provider), "codex")
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -3773,6 +3774,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	persistAuthState := !result.Success || !isCodexResult
 	var quotaSummary codexQuotaUpdateSummary
 	quotaStateChanged := false
 	quotaWarmupMissingHeaders := false
@@ -3793,7 +3795,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		if result.Success {
-			if strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
+			if isCodexResult {
 				quotaSummary, quotaStateChanged = updateCodexQuotaFromHeaders(auth, result.Headers, now)
 				if len(quotaSummary.Windows) == 0 {
 					if quotaWindow, okWindow := selectorQuotaPriorityExhaustionWindow(m.selector); okWindow && lacksQuotaWindowScore(auth, now, quotaWindow) {
@@ -3805,6 +3807,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
+				if isCodexResult && modelSuccessRecoveryStateNeedsPersist(auth, result.Model, state, now) {
+					persistAuthState = true
+				}
 				resetModelState(state, now)
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) {
@@ -3816,6 +3821,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				shouldResumeModel = true
 				clearModelQuota = true
 			} else {
+				if isCodexResult && authSuccessRecoveryStateNeedsPersist(auth) {
+					persistAuthState = true
+				}
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
@@ -3928,7 +3936,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		if !result.Success || !strings.EqualFold(strings.TrimSpace(result.Provider), "codex") {
+		if persistAuthState {
 			_ = m.persist(ctx, auth)
 		}
 		authSnapshot = auth.Clone()
@@ -4010,6 +4018,29 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	return true
+}
+
+func modelSuccessRecoveryStateNeedsPersist(auth *Auth, model string, state *ModelState, now time.Time) bool {
+	if !modelStateIsClean(state) {
+		return true
+	}
+	if !authSuccessRecoveryStateNeedsPersist(auth) {
+		return false
+	}
+	return !hasOtherModelError(auth, model, state, now)
+}
+
+func authSuccessRecoveryStateNeedsPersist(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Status == StatusError || auth.Unavailable || auth.StatusMessage != "" || auth.LastError != nil || !auth.NextRetryAfter.IsZero() {
+		return true
+	}
+	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() || auth.Quota.BackoffLevel != 0 {
+		return true
+	}
+	return false
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
@@ -4105,6 +4136,26 @@ func hasModelError(auth *Auth, now time.Time) bool {
 		}
 		if state.Status == StatusError {
 			if state.Unavailable && (state.NextRetryAfter.IsZero() || state.NextRetryAfter.After(now)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasOtherModelError(auth *Auth, model string, state *ModelState, now time.Time) bool {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return false
+	}
+	for modelKey, candidate := range auth.ModelStates {
+		if candidate == nil || candidate == state || modelKey == model {
+			continue
+		}
+		if candidate.LastError != nil {
+			return true
+		}
+		if candidate.Status == StatusError {
+			if candidate.Unavailable && (candidate.NextRetryAfter.IsZero() || candidate.NextRetryAfter.After(now)) {
 				return true
 			}
 		}
