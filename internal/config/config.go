@@ -94,6 +94,8 @@ type Config struct {
 
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
+	// SameAuthNetworkRetry defines additional same-credential retries for network-like failures.
+	SameAuthNetworkRetry int `yaml:"same-auth-network-retry" json:"same-auth-network-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
 	// Set to 0 or a negative value to keep trying all available credentials (legacy behavior).
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
@@ -780,6 +782,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
+	}
+	if cfg.SameAuthNetworkRetry < 0 {
+		cfg.SameAuthNetworkRetry = 0
 	}
 
 	cfg.NormalizePluginsConfig()

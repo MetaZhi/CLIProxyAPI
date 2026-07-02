@@ -327,6 +327,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		authManager.SetSameAuthNetworkRetry(cfg.SameAuthNetworkRetry)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
@@ -677,6 +678,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
 		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
 		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
+		mgmt.GET("/same-auth-network-retry", s.mgmt.GetSameAuthNetworkRetry)
+		mgmt.PUT("/same-auth-network-retry", s.mgmt.PutSameAuthNetworkRetry)
+		mgmt.PATCH("/same-auth-network-retry", s.mgmt.PutSameAuthNetworkRetry)
 		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
 		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
@@ -1642,6 +1646,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		s.handlers.AuthManager.SetSameAuthNetworkRetry(cfg.SameAuthNetworkRetry)
 	}
 
 	// Update log level dynamically when debug flag changes

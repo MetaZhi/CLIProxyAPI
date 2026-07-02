@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"sync"
 	"testing"
@@ -224,6 +225,88 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	return out
 }
 
+type sameAuthNetworkRetryExecutor struct {
+	id string
+
+	mu            sync.Mutex
+	executeCalls  []string
+	executeErrors map[string][]error
+	streamCalls   []string
+	streamPlans   map[string][]sameAuthNetworkRetryStreamPlan
+}
+
+type sameAuthNetworkRetryStreamPlan struct {
+	openErr error
+	chunks  []cliproxyexecutor.StreamChunk
+}
+
+func (e *sameAuthNetworkRetryExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *sameAuthNetworkRetryExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, auth.ID)
+	var err error
+	if queue := e.executeErrors[auth.ID]; len(queue) > 0 {
+		err = queue[0]
+		e.executeErrors[auth.ID] = queue[1:]
+	}
+	e.mu.Unlock()
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID), Headers: http.Header{"X-Auth": {auth.ID}}}, nil
+}
+
+func (e *sameAuthNetworkRetryExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.streamCalls = append(e.streamCalls, auth.ID)
+	plan := sameAuthNetworkRetryStreamPlan{chunks: []cliproxyexecutor.StreamChunk{{Payload: []byte(auth.ID)}}}
+	if queue := e.streamPlans[auth.ID]; len(queue) > 0 {
+		plan = queue[0]
+		e.streamPlans[auth.ID] = queue[1:]
+	}
+	e.mu.Unlock()
+	if plan.openErr != nil {
+		return nil, plan.openErr
+	}
+	ch := make(chan cliproxyexecutor.StreamChunk, len(plan.chunks))
+	for _, chunk := range plan.chunks {
+		ch <- chunk
+	}
+	close(ch)
+	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
+}
+
+func (e *sameAuthNetworkRetryExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *sameAuthNetworkRetryExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return e.Execute(ctx, auth, req, opts)
+}
+
+func (e *sameAuthNetworkRetryExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *sameAuthNetworkRetryExecutor) ExecuteCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.executeCalls))
+	copy(out, e.executeCalls)
+	return out
+}
+
+func (e *sameAuthNetworkRetryExecutor) StreamCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.streamCalls))
+	copy(out, e.streamCalls)
+	return out
+}
+
 type retryAfterStatusError struct {
 	status     int
 	message    string
@@ -332,6 +415,222 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
 			}
 		})
+	}
+}
+
+func newSameAuthNetworkRetryTestManager(t *testing.T, sameAuthRetry, maxRetryCredentials int, executor *sameAuthNetworkRetryExecutor, authIDs ...string) *Manager {
+	t.Helper()
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, maxRetryCredentials)
+	m.SetSameAuthNetworkRetry(sameAuthRetry)
+	m.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	for _, id := range authIDs {
+		reg.RegisterClient(id, executor.id, []*registry.ModelInfo{{ID: "test-model"}})
+		auth := &Auth{ID: id, Provider: executor.id}
+		if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("register %s: %v", id, errRegister)
+		}
+	}
+	t.Cleanup(func() {
+		for _, id := range authIDs {
+			reg.UnregisterClient(id)
+		}
+	})
+
+	return m
+}
+
+func TestManager_SameAuthNetworkRetryRetriesSameAuthBeforeSwitching(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 1, executor, auth1)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want success", errExecute)
+	}
+	if string(resp.Payload) != auth1 {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), auth1)
+	}
+	got := executor.ExecuteCalls()
+	want := []string{auth1, auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManager_SameAuthNetworkRetryExhaustsThenSwitchesOnce(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	auth2 := "bb-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 2, executor, auth1, auth2)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want success", errExecute)
+	}
+	if string(resp.Payload) != auth2 {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), auth2)
+	}
+	got := executor.ExecuteCalls()
+	want := []string{auth1, auth1, auth1, auth2}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManager_SameAuthNetworkRetryRespectsMaxRetryCredentialsOne(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	auth2 := "bb-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 1, executor, auth1, auth2)
+
+	if _, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{}); errExecute == nil {
+		t.Fatalf("expected execute error")
+	}
+	got := executor.ExecuteCalls()
+	want := []string{auth1, auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManager_SameAuthNetworkRetryDoesNotRetry429(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	auth2 := "bb-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {&retryAfterStatusError{status: http.StatusTooManyRequests, message: "quota"}},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 2, executor, auth1, auth2)
+
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want success", errExecute)
+	}
+	if string(resp.Payload) != auth2 {
+		t.Fatalf("payload = %q, want %q", string(resp.Payload), auth2)
+	}
+	got := executor.ExecuteCalls()
+	want := []string{auth1, auth2}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManagerExecuteStream_SameAuthNetworkRetryRetriesBootstrapError(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		streamPlans: map[string][]sameAuthNetworkRetryStreamPlan{
+			auth1: {
+				{chunks: []cliproxyexecutor.StreamChunk{{Err: io.ErrUnexpectedEOF}}},
+				{chunks: []cliproxyexecutor.StreamChunk{{Err: io.ErrUnexpectedEOF}}},
+				{chunks: []cliproxyexecutor.StreamChunk{{Payload: []byte(auth1)}}},
+			},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 1, executor, auth1)
+
+	result, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want success", errExecute)
+	}
+	chunk, ok := <-result.Chunks
+	if !ok {
+		t.Fatalf("expected stream payload")
+	}
+	if string(chunk.Payload) != auth1 {
+		t.Fatalf("payload = %q, want %q", string(chunk.Payload), auth1)
+	}
+	got := executor.StreamCalls()
+	want := []string{auth1, auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestManagerExecuteStream_SameAuthNetworkRetryDoesNotRetryAfterPayload(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	auth2 := "bb-" + base
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		streamPlans: map[string][]sameAuthNetworkRetryStreamPlan{
+			auth1: {
+				{chunks: []cliproxyexecutor.StreamChunk{{Payload: []byte("first")}, {Err: io.ErrUnexpectedEOF}}},
+			},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 2, executor, auth1, auth2)
+
+	result, errExecute := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want stream result", errExecute)
+	}
+	var sawErr bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Fatalf("expected stream error after payload")
+	}
+	got := executor.StreamCalls()
+	want := []string{auth1}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("stream calls = %v, want %v", got, want)
 	}
 }
 

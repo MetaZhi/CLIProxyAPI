@@ -116,6 +116,10 @@ passthrough-headers: false
 # Number of times to retry a request. Retries will occur if the HTTP response code is 403, 408, 500, 502, 503, or 504.
 request-retry: 3
 
+# Number of additional same-credential retries for network-like failures before switching credentials.
+# Default is 0 (disabled). Set to 2 with max-retry-credentials: 2 to retry the same auth twice, then switch once.
+same-auth-network-retry: 0
+
 # Maximum number of different credentials to try for one failed request.
 # Set to 0 to keep legacy behavior (try all available credentials).
 max-retry-credentials: 0

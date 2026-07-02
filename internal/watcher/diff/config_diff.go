@@ -72,6 +72,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RequestRetry != newCfg.RequestRetry {
 		changes = append(changes, fmt.Sprintf("request-retry: %d -> %d", oldCfg.RequestRetry, newCfg.RequestRetry))
 	}
+	if oldCfg.SameAuthNetworkRetry != newCfg.SameAuthNetworkRetry {
+		changes = append(changes, fmt.Sprintf("same-auth-network-retry: %d -> %d", oldCfg.SameAuthNetworkRetry, newCfg.SameAuthNetworkRetry))
+	}
 	if oldCfg.MaxRetryCredentials != newCfg.MaxRetryCredentials {
 		changes = append(changes, fmt.Sprintf("max-retry-credentials: %d -> %d", oldCfg.MaxRetryCredentials, newCfg.MaxRetryCredentials))
 	}

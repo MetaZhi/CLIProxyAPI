@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -235,9 +236,10 @@ type Manager struct {
 	providerOffsets map[string]int
 
 	// Retry controls request retry behavior.
-	requestRetry        atomic.Int32
-	maxRetryCredentials atomic.Int32
-	maxRetryInterval    atomic.Int64
+	requestRetry         atomic.Int32
+	sameAuthNetworkRetry atomic.Int32
+	maxRetryCredentials  atomic.Int32
+	maxRetryInterval     atomic.Int64
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -1890,38 +1892,81 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
+	sameAuthNetworkRetry := m.sameAuthNetworkRetryLimit()
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
-		if errStream != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				return nil, errCtx
+		for sameAttempt := 0; ; sameAttempt++ {
+			streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+			if errStream != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					return nil, errCtx
+				}
+				if retryable, class := sameAuthNetworkRetryableError(errStream); retryable {
+					if sameAttempt < sameAuthNetworkRetry {
+						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-open", sameAttempt+1, sameAuthNetworkRetry, class, errStream)
+						continue
+					}
+					if sameAuthNetworkRetry > 0 {
+						m.logSameAuthNetworkRetryExhausted(ctx, auth, provider, resultModel, "stream-open", sameAuthNetworkRetry, class, errStream)
+					}
+				}
+				rerr := &Error{Message: errStream.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+					rerr.HTTPStatus = se.StatusCode()
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(errStream)
+				m.MarkResult(ctx, result)
+				if isRequestInvalidError(errStream) {
+					return nil, errStream
+				}
+				lastErr = errStream
+				break
 			}
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
-			if isRequestInvalidError(errStream) {
-				return nil, errStream
-			}
-			lastErr = errStream
-			continue
-		}
 
-		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
-		if bootstrapErr != nil {
-			if errCtx := ctx.Err(); errCtx != nil {
-				discardStreamChunks(streamResult.Chunks)
-				return nil, errCtx
-			}
-			if isRequestInvalidError(bootstrapErr) {
+			buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
+			if bootstrapErr != nil {
+				if errCtx := ctx.Err(); errCtx != nil {
+					discardStreamChunks(streamResult.Chunks)
+					return nil, errCtx
+				}
+				if retryable, class := sameAuthNetworkRetryableError(bootstrapErr); retryable {
+					if sameAttempt < sameAuthNetworkRetry {
+						discardStreamChunks(streamResult.Chunks)
+						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-bootstrap", sameAttempt+1, sameAuthNetworkRetry, class, bootstrapErr)
+						continue
+					}
+					if sameAuthNetworkRetry > 0 {
+						m.logSameAuthNetworkRetryExhausted(ctx, auth, provider, resultModel, "stream-bootstrap", sameAuthNetworkRetry, class, bootstrapErr)
+					}
+				}
+				if isRequestInvalidError(bootstrapErr) {
+					rerr := &Error{Message: bootstrapErr.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+						rerr.HTTPStatus = se.StatusCode()
+					}
+					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+					result.RetryAfter = retryAfterFromError(bootstrapErr)
+					m.MarkResult(ctx, result)
+					discardStreamChunks(streamResult.Chunks)
+					return nil, bootstrapErr
+				}
+				if idx < len(execModels)-1 {
+					rerr := &Error{Message: bootstrapErr.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+						rerr.HTTPStatus = se.StatusCode()
+					}
+					result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+					result.RetryAfter = retryAfterFromError(bootstrapErr)
+					m.MarkResult(ctx, result)
+					discardStreamChunks(streamResult.Chunks)
+					lastErr = bootstrapErr
+					break
+				}
 				rerr := &Error{Message: bootstrapErr.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
@@ -1930,49 +1975,37 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
-				return nil, bootstrapErr
+				return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 			}
-			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
+
+			if closed && len(buffered) == 0 {
+				emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+				if retryable, class := sameAuthNetworkRetryableError(emptyErr); retryable {
+					if sameAttempt < sameAuthNetworkRetry {
+						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-empty", sameAttempt+1, sameAuthNetworkRetry, class, emptyErr)
+						continue
+					}
+					if sameAuthNetworkRetry > 0 {
+						m.logSameAuthNetworkRetryExhausted(ctx, auth, provider, resultModel, "stream-empty", sameAuthNetworkRetry, class, emptyErr)
+					}
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
 				m.MarkResult(ctx, result)
-				discardStreamChunks(streamResult.Chunks)
-				lastErr = bootstrapErr
-				continue
+				if idx < len(execModels)-1 {
+					lastErr = emptyErr
+					break
+				}
+				return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
-			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
-			discardStreamChunks(streamResult.Chunks)
-			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
-		}
 
-		if closed && len(buffered) == 0 {
-			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
-			if idx < len(execModels)-1 {
-				lastErr = emptyErr
-				continue
+			remaining := streamResult.Chunks
+			if closed {
+				closedCh := make(chan cliproxyexecutor.StreamChunk)
+				close(closedCh)
+				remaining = closedCh
 			}
-			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
 		}
-
-		remaining := streamResult.Chunks
-		if closed {
-			closedCh := make(chan cliproxyexecutor.StreamChunk)
-			close(closedCh)
-			remaining = closedCh
-		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2123,6 +2156,17 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	m.requestRetry.Store(int32(retry))
 	m.maxRetryCredentials.Store(int32(maxRetryCredentials))
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
+// SetSameAuthNetworkRetry updates additional same-credential retries for network-like failures.
+func (m *Manager) SetSameAuthNetworkRetry(retry int) {
+	if m == nil {
+		return
+	}
+	if retry < 0 {
+		retry = 0
+	}
+	m.sameAuthNetworkRetry.Store(int32(retry))
 }
 
 // RegisterExecutor registers a provider executor with the manager.
@@ -2592,36 +2636,48 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			continue
 		}
 		var authErr error
+		sameAuthNetworkRetry := m.sameAuthNetworkRetryLimit()
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
+			for sameAttempt := 0; ; sameAttempt++ {
+				resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
+					}
+					if retryable, class := sameAuthNetworkRetryableError(errExec); retryable {
+						if sameAttempt < sameAuthNetworkRetry {
+							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "execute", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
+							continue
+						}
+						if sameAuthNetworkRetry > 0 {
+							m.logSameAuthNetworkRetryExhausted(execCtx, auth, provider, resultModel, "execute", sameAuthNetworkRetry, class, errExec)
+						}
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					if isRequestInvalidError(errExec) {
+						return cliproxyexecutor.Response{}, errExec
+					}
+					authErr = errExec
+					break
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
-				}
+				result.Headers = resp.Headers
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
-				}
-				authErr = errExec
-				continue
+				rewriteForceMappedResponse(&resp, aliasResult)
+				return resp, nil
 			}
-			result.Headers = resp.Headers
-			m.MarkResult(execCtx, result)
-			rewriteForceMappedResponse(&resp, aliasResult)
-			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
@@ -2695,35 +2751,47 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			continue
 		}
 		var authErr error
+		sameAuthNetworkRetry := m.sameAuthNetworkRetryLimit()
 		for _, upstreamModel := range models {
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+			for sameAttempt := 0; ; sameAttempt++ {
+				resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
+					}
+					if retryable, class := sameAuthNetworkRetryableError(errExec); retryable {
+						if sameAttempt < sameAuthNetworkRetry {
+							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "count", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
+							continue
+						}
+						if sameAuthNetworkRetry > 0 {
+							m.logSameAuthNetworkRetryExhausted(execCtx, auth, provider, resultModel, "count", sameAuthNetworkRetry, class, errExec)
+						}
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					if isRequestInvalidError(errExec) {
+						return cliproxyexecutor.Response{}, errExec
+					}
+					authErr = errExec
+					break
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
-				}
-				authErr = errExec
-				continue
+				rewriteForceMappedResponse(&resp, aliasResult)
+				return resp, nil
 			}
-			m.MarkResult(execCtx, result)
-			rewriteForceMappedResponse(&resp, aliasResult)
-			return resp, nil
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
@@ -3404,6 +3472,139 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 		return 0, 0, 0
 	}
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
+}
+
+func (m *Manager) sameAuthNetworkRetryLimit() int {
+	if m == nil {
+		return 0
+	}
+	retry := int(m.sameAuthNetworkRetry.Load())
+	if retry < 0 {
+		return 0
+	}
+	return retry
+}
+
+func sameAuthNetworkRetryableError(err error) (bool, string) {
+	if err == nil {
+		return false, ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return false, ""
+	}
+	if isRequestInvalidError(err) {
+		return false, ""
+	}
+
+	status := statusCodeFromError(err)
+	switch status {
+	case http.StatusRequestTimeout:
+		return true, "http_408"
+	case http.StatusBadGateway:
+		return true, "http_502"
+	case http.StatusServiceUnavailable:
+		return true, "http_503"
+	case http.StatusGatewayTimeout:
+		return true, "http_504"
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests, http.StatusUnprocessableEntity:
+		return false, ""
+	}
+
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		if strings.EqualFold(strings.TrimSpace(authErr.Code), "empty_stream") {
+			return true, "empty_stream"
+		}
+		if authErr.HTTPStatus > 0 {
+			return false, ""
+		}
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr != nil {
+		if netErr.Timeout() {
+			return true, "net_timeout"
+		}
+		type temporary interface {
+			Temporary() bool
+		}
+		if temp, ok := netErr.(temporary); ok && temp.Temporary() {
+			return true, "net_temporary"
+		}
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true, "unexpected_eof"
+	}
+	if errors.Is(err, io.EOF) {
+		return true, "eof"
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "unexpected eof"):
+		return true, "unexpected_eof"
+	case strings.Contains(msg, "eof"):
+		return true, "eof"
+	case strings.Contains(msg, "connection reset"):
+		return true, "connection_reset"
+	case strings.Contains(msg, "connection refused"):
+		return true, "connection_refused"
+	case strings.Contains(msg, "broken pipe"):
+		return true, "broken_pipe"
+	case strings.Contains(msg, "i/o timeout"):
+		return true, "io_timeout"
+	case strings.Contains(msg, "tls handshake timeout"):
+		return true, "tls_handshake_timeout"
+	case strings.Contains(msg, "dial tcp"):
+		return true, "dial"
+	case strings.Contains(msg, "no such host"):
+		return true, "dns"
+	case strings.Contains(msg, "proxyconnect"):
+		return true, "proxy_connect"
+	case strings.Contains(msg, "use of closed network connection"):
+		return true, "closed_network_connection"
+	case strings.Contains(msg, "websocket: close 1006"):
+		return true, "websocket_abnormal_close"
+	}
+	return false, ""
+}
+
+func (m *Manager) logSameAuthNetworkRetry(ctx context.Context, auth *Auth, provider, model, stage string, attempt, maxAttempts int, class string, err error) {
+	entry := logEntryWithRequestID(ctx)
+	if entry == nil {
+		entry = log.NewEntry(log.StandardLogger())
+	}
+	fields := log.Fields{
+		"provider":     provider,
+		"model":        model,
+		"stage":        stage,
+		"attempt":      attempt,
+		"max_attempts": maxAttempts,
+		"error_class":  class,
+	}
+	if auth != nil {
+		fields["auth"] = auth.ID
+	}
+	entry.WithFields(fields).WithError(err).Warn("same-auth network retry")
+}
+
+func (m *Manager) logSameAuthNetworkRetryExhausted(ctx context.Context, auth *Auth, provider, model, stage string, maxAttempts int, class string, err error) {
+	entry := logEntryWithRequestID(ctx)
+	if entry == nil {
+		entry = log.NewEntry(log.StandardLogger())
+	}
+	fields := log.Fields{
+		"provider":     provider,
+		"model":        model,
+		"stage":        stage,
+		"max_attempts": maxAttempts,
+		"error_class":  class,
+	}
+	if auth != nil {
+		fields["auth"] = auth.ID
+	}
+	entry.WithFields(fields).WithError(err).Warn("same-auth network retry exhausted")
 }
 
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {

@@ -265,6 +265,14 @@ func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
 }
 
+// Same-auth network retry
+func (h *Handler) GetSameAuthNetworkRetry(c *gin.Context) {
+	c.JSON(200, gin.H{"same-auth-network-retry": h.cfg.SameAuthNetworkRetry})
+}
+func (h *Handler) PutSameAuthNetworkRetry(c *gin.Context) {
+	h.updateIntField(c, func(v int) { h.cfg.SameAuthNetworkRetry = v })
+}
+
 // Max retry interval
 func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})

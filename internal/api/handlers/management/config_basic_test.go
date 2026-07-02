@@ -33,6 +33,46 @@ func TestGetRoutingQuotaPriorityWindow_Default(t *testing.T) {
 	}
 }
 
+func TestSameAuthNetworkRetry_GetAndPut(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("request-retry: 3\nsame-auth-network-retry: 0\n"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	handler := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: configPath,
+	}
+
+	getRec := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRec)
+	handler.GetSameAuthNetworkRetry(getCtx)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d", getRec.Code, http.StatusOK)
+	}
+	var getPayload map[string]int
+	if err := json.Unmarshal(getRec.Body.Bytes(), &getPayload); err != nil {
+		t.Fatalf("json.Unmarshal(GET) error = %v", err)
+	}
+	if getPayload["same-auth-network-retry"] != 0 {
+		t.Fatalf("same-auth-network-retry = %d, want 0", getPayload["same-auth-network-retry"])
+	}
+
+	putRec := httptest.NewRecorder()
+	putCtx, _ := gin.CreateTestContext(putRec)
+	putCtx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/same-auth-network-retry", bytes.NewBufferString(`{"value":2}`))
+	putCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.PutSameAuthNetworkRetry(putCtx)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d; body=%s", putRec.Code, http.StatusOK, putRec.Body.String())
+	}
+	if handler.cfg.SameAuthNetworkRetry != 2 {
+		t.Fatalf("handler.cfg.SameAuthNetworkRetry = %d, want 2", handler.cfg.SameAuthNetworkRetry)
+	}
+}
+
 func TestPutRoutingQuotaPriorityWindow_RejectsInvalidDuration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
