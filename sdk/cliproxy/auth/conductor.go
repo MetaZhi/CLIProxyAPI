@@ -1386,14 +1386,12 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
-			if quotaExhaustionWindow > 0 {
-				if resetAt, exhausted := quotaPriorityWindowExhaustedUntil(candidate, now, quotaExhaustionWindow); exhausted {
-					cooldownCount++
-					if earliest.IsZero() || resetAt.Before(earliest) {
-						earliest = resetAt
-					}
-					continue
+			if resetAt, quotaBlocked := quotaAvailabilityBlockedUntil(candidate, now, quotaExhaustionWindow); quotaBlocked {
+				cooldownCount++
+				if earliest.IsZero() || resetAt.Before(earliest) {
+					earliest = resetAt
 				}
+				continue
 			}
 			priority := authPriority(candidate)
 			availableByPriority[priority] = append(availableByPriority[priority], candidate)
@@ -2212,6 +2210,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 	now := time.Now()
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -2242,6 +2241,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
@@ -2363,6 +2363,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}

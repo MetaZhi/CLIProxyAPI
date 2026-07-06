@@ -415,6 +415,74 @@ func TestSchedulerPick_MinimumQuotaRespectsPriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_PerAuthMinimumQuotaSkipsBlockedHighPriority(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	tests := []struct {
+		name     string
+		selector Selector
+	}{
+		{name: "round-robin", selector: &RoundRobinSelector{}},
+		{name: "fill-first", selector: &FillFirstSelector{}},
+		{name: "quota-priority", selector: NewQuotaPrioritySelector(5 * time.Hour)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheduler := newSchedulerForTest(
+				tt.selector,
+				withMinimumQuotaThresholds(&Auth{ID: "high-low-5h", Provider: "codex", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+					"5h": {remainingPercent: 5, resetIn: 5 * time.Hour},
+				})}, map[string]float64{"5h": 10}),
+				&Auth{ID: "low-eligible", Provider: "codex", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+					"5h": {remainingPercent: 50, resetIn: 5 * time.Hour},
+				})},
+			)
+
+			got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+			if errPick != nil {
+				t.Fatalf("pickSingle() error = %v", errPick)
+			}
+			if got == nil {
+				t.Fatalf("pickSingle() auth = nil")
+			}
+			if got.ID != "low-eligible" {
+				t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "low-eligible")
+			}
+		})
+	}
+}
+
+func TestSchedulerPick_PerAuthMinimumQuotaAllBlockedReturnsCooldown(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		withMinimumQuotaThresholds(&Auth{ID: "only-low-5h", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 5, resetIn: 5 * time.Hour},
+		})}, map[string]float64{"5h": 10}),
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatalf("pickSingle() error = nil, auth = %#v", got)
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() error = %T %v, want modelCooldownError", errPick, errPick)
+	}
+	if cooldownErr.provider != "codex" {
+		t.Fatalf("cooldown provider = %q, want codex", cooldownErr.provider)
+	}
+	if cooldownErr.resetIn <= 0 || cooldownErr.resetIn > 5*time.Hour {
+		t.Fatalf("cooldown resetIn = %s, want within 5h", cooldownErr.resetIn)
+	}
+}
+
 func TestSchedulerPick_QuotaPriorityAppliesMinimumQuotaBeforeQuota(t *testing.T) {
 	t.Parallel()
 

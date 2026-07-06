@@ -94,6 +94,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+			hasPerAccountMinimumQuotaPercent := coreauth.OAuthMinimumQuotaPercentMetadataPresent(metadata)
+			perAccountMinimumQuotaPercent := coreauth.OAuthMinimumQuotaPercentFromMetadata(metadata)
 			for index, auth := range auths {
 				if auth == nil {
 					continue
@@ -110,6 +112,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 				auth.Attributes[coreauth.AttributeSource] = fullPath
 				auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
 				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
+				if hasPerAccountMinimumQuotaPercent {
+					coreauth.SetOAuthMinimumQuotaPercentAttribute(auth, perAccountMinimumQuotaPercent)
+				}
 				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
 				coreauth.ApplyCustomHeadersFromMetadata(auth)
 			}
@@ -157,6 +162,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	// Read per-account excluded models from the OAuth JSON file.
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+	perAccountMinimumQuotaPercent := coreauth.OAuthMinimumQuotaPercentFromMetadata(metadata)
 
 	a := &coreauth.Auth{
 		ID:       id,
@@ -197,6 +203,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
+	coreauth.SetOAuthMinimumQuotaPercentAttribute(a, perAccountMinimumQuotaPercent)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {

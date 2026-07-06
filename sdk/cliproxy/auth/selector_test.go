@@ -30,6 +30,11 @@ func quotaWindowMetadata(now time.Time, windows map[string]quotaWindowTestSpec) 
 	return map[string]any{quotaWindowsMetadataKey: out}
 }
 
+func withMinimumQuotaThresholds(auth *Auth, thresholds map[string]float64) *Auth {
+	SetOAuthMinimumQuotaPercentAttribute(auth, thresholds)
+	return auth
+}
+
 func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	t.Parallel()
 
@@ -102,6 +107,84 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 		if got.ID == "c" {
 			t.Fatalf("Pick() #%d unexpectedly selected lower priority auth", i)
 		}
+	}
+}
+
+func TestRoundRobinSelectorPick_PerAuthMinimumQuotaSkipsHigherPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		withMinimumQuotaThresholds(&Auth{ID: "high-low-5h", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 9, resetIn: 5 * time.Hour},
+		})}, map[string]float64{"5h": 10}),
+		{ID: "low-eligible", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h": {remainingPercent: 50, resetIn: 5 * time.Hour},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "low-eligible" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low-eligible")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_PerAuthWeekThresholdBlocksFiveHourCandidate(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(5 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		withMinimumQuotaThresholds(&Auth{ID: "blocked-week", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h":   {remainingPercent: 90, resetIn: time.Hour},
+			"week": {remainingPercent: 10, resetIn: 7 * 24 * time.Hour},
+		})}, map[string]float64{"week": 20}),
+		{ID: "eligible", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"5h":   {remainingPercent: 40, resetIn: time.Hour},
+			"week": {remainingPercent: 50, resetIn: 7 * 24 * time.Hour},
+		})},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "eligible" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "eligible")
+	}
+}
+
+func TestRoundRobinSelectorPick_UnknownPerAuthMinimumQuotaWindowSelectable(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "high-unknown-threshold", Attributes: map[string]string{"priority": "10", oauthMinimumQuotaPercentAttributeKey: `{"month":80}`}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"month": {remainingPercent: 1, resetIn: 30 * 24 * time.Hour},
+		})},
+		{ID: "low", Attributes: map[string]string{"priority": "0"}},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "high-unknown-threshold" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "high-unknown-threshold")
 	}
 }
 

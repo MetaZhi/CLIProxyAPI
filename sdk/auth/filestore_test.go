@@ -90,7 +90,7 @@ func TestExtractAccessToken(t *testing.T) {
 func TestFileTokenStoreListExpandsPluginMultiAuths(t *testing.T) {
 	baseDir := t.TempDir()
 	path := filepath.Join(baseDir, "geminicli.json")
-	if errWrite := os.WriteFile(path, []byte(`{"type":"gemini-cli","headers":{"X-Test":"value"}}`), 0o600); errWrite != nil {
+	if errWrite := os.WriteFile(path, []byte(`{"type":"gemini-cli","minimum_quota_percent":{"5h":10,"week":"20%"},"headers":{"X-Test":"value"}}`), 0o600); errWrite != nil {
 		t.Fatalf("write auth file: %v", errWrite)
 	}
 
@@ -152,9 +152,49 @@ func TestFileTokenStoreListExpandsPluginMultiAuths(t *testing.T) {
 		if gotHeader := auth.Attributes["header:X-Test"]; gotHeader != "value" {
 			t.Fatalf("header:X-Test = %q, want value", gotHeader)
 		}
+		gotMinimumQuota := cliproxyauth.OAuthMinimumQuotaPercentFromAttributes(auth.Attributes)
+		if gotMinimumQuota["5h"] != 10 || gotMinimumQuota["week"] != 20 || len(gotMinimumQuota) != 2 {
+			t.Fatalf("minimum_quota_percent = %#v, want 5h=10 week=20", gotMinimumQuota)
+		}
 	}
 	if gotProject := auths[1].Metadata["project_id"]; gotProject != "project-a" {
 		t.Fatalf("project_id = %#v, want project-a", gotProject)
+	}
+}
+
+func TestFileTokenStoreListPreservesPluginMinimumQuotaPercentWhenFileOmitsOverride(t *testing.T) {
+	baseDir := t.TempDir()
+	path := filepath.Join(baseDir, "geminicli.json")
+	if errWrite := os.WriteFile(path, []byte(`{"type":"gemini-cli","headers":{"X-Test":"value"}}`), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+
+	RegisterPluginAuthParser(fileStoreMultiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*cliproxyauth.Auth, bool, error) {
+		auth := &cliproxyauth.Auth{
+			ID:         "geminicli.json",
+			Provider:   "gemini-cli",
+			Attributes: map[string]string{},
+			Metadata:   map[string]any{"type": "gemini-cli"},
+		}
+		cliproxyauth.SetOAuthMinimumQuotaPercentAttribute(auth, map[string]float64{"5h": 25})
+		return []*cliproxyauth.Auth{auth}, true, nil
+	}))
+	t.Cleanup(func() {
+		RegisterPluginAuthParser(nil)
+	})
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, errList := store.List(context.Background())
+	if errList != nil {
+		t.Fatalf("List() error = %v", errList)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("List() len = %d, want one plugin auth", len(auths))
+	}
+	gotMinimumQuota := cliproxyauth.OAuthMinimumQuotaPercentFromAttributes(auths[0].Attributes)
+	if gotMinimumQuota["5h"] != 25 || len(gotMinimumQuota) != 1 {
+		t.Fatalf("minimum_quota_percent = %#v, want preserved 5h=25", gotMinimumQuota)
 	}
 }
 

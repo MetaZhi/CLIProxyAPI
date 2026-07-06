@@ -165,7 +165,7 @@ func TestFileSynthesizer_Synthesize_IgnoresGeminiProviderFile(t *testing.T) {
 func TestSynthesizeAuthFileExpandsPluginMultiAuths(t *testing.T) {
 	tempDir := t.TempDir()
 	fullPath := filepath.Join(tempDir, "geminicli.json")
-	raw := []byte(`{"type":"gemini-cli","excluded_models":["model-a"],"headers":{"X-Test":"value"}}`)
+	raw := []byte(`{"type":"gemini-cli","excluded_models":["model-a"],"minimum_quota_percent":{"5h":10,"week":"20%"},"headers":{"X-Test":"value"}}`)
 
 	ctx := &SynthesisContext{
 		Config:  &config.Config{},
@@ -225,9 +225,44 @@ func TestSynthesizeAuthFileExpandsPluginMultiAuths(t *testing.T) {
 		if gotKind := auth.Attributes["auth_kind"]; gotKind != "oauth" {
 			t.Fatalf("auth_kind = %q, want oauth", gotKind)
 		}
+		gotMinimumQuota := coreauth.OAuthMinimumQuotaPercentFromAttributes(auth.Attributes)
+		if gotMinimumQuota["5h"] != 10 || gotMinimumQuota["week"] != 20 || len(gotMinimumQuota) != 2 {
+			t.Fatalf("minimum_quota_percent = %#v, want 5h=10 week=20", gotMinimumQuota)
+		}
 	}
 	if gotProject := auths[1].Metadata["project_id"]; gotProject != "project-a" {
 		t.Fatalf("project_id = %#v, want project-a", gotProject)
+	}
+}
+
+func TestSynthesizeAuthFilePreservesPluginMinimumQuotaPercentWhenFileOmitsOverride(t *testing.T) {
+	tempDir := t.TempDir()
+	fullPath := filepath.Join(tempDir, "geminicli.json")
+	raw := []byte(`{"type":"gemini-cli","headers":{"X-Test":"value"}}`)
+
+	ctx := &SynthesisContext{
+		Config:  &config.Config{},
+		AuthDir: tempDir,
+		Now:     time.Date(2026, 6, 21, 0, 0, 0, 0, time.UTC),
+		PluginAuthParser: multiAuthParserFunc(func(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+			auth := &coreauth.Auth{
+				ID:         "geminicli.json",
+				Provider:   "gemini-cli",
+				Attributes: map[string]string{},
+				Metadata:   map[string]any{"type": "gemini-cli"},
+			}
+			coreauth.SetOAuthMinimumQuotaPercentAttribute(auth, map[string]float64{"5h": 25})
+			return []*coreauth.Auth{auth}, true, nil
+		}),
+	}
+
+	auths := SynthesizeAuthFile(ctx, fullPath, raw)
+	if len(auths) != 1 {
+		t.Fatalf("SynthesizeAuthFile() len = %d, want one plugin auth", len(auths))
+	}
+	gotMinimumQuota := coreauth.OAuthMinimumQuotaPercentFromAttributes(auths[0].Attributes)
+	if gotMinimumQuota["5h"] != 25 || len(gotMinimumQuota) != 1 {
+		t.Fatalf("minimum_quota_percent = %#v, want preserved 5h=25", gotMinimumQuota)
 	}
 }
 
@@ -551,6 +586,87 @@ func TestFileSynthesizer_Synthesize_OAuthModelAliases(t *testing.T) {
 	want := `[{"name":"gpt-5.3-codex-spark","alias":"gpt-5.5"},{"name":"gpt-5.3-codex-spark","alias":"gpt-5.4","fork":true}]`
 	if got != want {
 		t.Fatalf("expected model_aliases %q, got %q", want, got)
+	}
+}
+
+func TestFileSynthesizer_Synthesize_OAuthMinimumQuotaPercent(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		raw  map[string]any
+		want map[string]float64
+	}{
+		{
+			name: "snake case numeric and string",
+			key:  "minimum_quota_percent",
+			raw: map[string]any{
+				"5h":      10,
+				"week":    "20%",
+				"month":   30,
+				"invalid": "bad",
+			},
+			want: map[string]float64{"5h": 10, "week": 20},
+		},
+		{
+			name: "kebab case ignores disabled and invalid",
+			key:  "minimum-quota-percent",
+			raw: map[string]any{
+				"5h":     "15",
+				"week":   "bad",
+				"weekly": 25,
+			},
+			want: map[string]float64{"5h": 15},
+		},
+		{
+			name: "zero disables window",
+			key:  "minimum_quota_percent",
+			raw: map[string]any{
+				"5h":   0,
+				"week": 0,
+			},
+			want: map[string]float64{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			authData := map[string]any{
+				"type":  "codex",
+				"email": "codex@example.com",
+				tt.key:  tt.raw,
+			}
+			data, _ := json.Marshal(authData)
+			errWriteFile := os.WriteFile(filepath.Join(tempDir, "codex-auth.json"), data, 0644)
+			if errWriteFile != nil {
+				t.Fatalf("failed to write auth file: %v", errWriteFile)
+			}
+
+			synth := NewFileSynthesizer()
+			ctx := &SynthesisContext{
+				Config:      &config.Config{},
+				AuthDir:     tempDir,
+				Now:         time.Now(),
+				IDGenerator: NewStableIDGenerator(),
+			}
+
+			auths, errSynthesize := synth.Synthesize(ctx)
+			if errSynthesize != nil {
+				t.Fatalf("unexpected error: %v", errSynthesize)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("expected 1 auth, got %d", len(auths))
+			}
+			got := coreauth.OAuthMinimumQuotaPercentFromAttributes(auths[0].Attributes)
+			if len(got) != len(tt.want) {
+				t.Fatalf("minimum_quota_percent = %#v, want %#v", got, tt.want)
+			}
+			for window, wantPercent := range tt.want {
+				if got[window] != wantPercent {
+					t.Fatalf("minimum_quota_percent[%s] = %v, want %v", window, got[window], wantPercent)
+				}
+			}
+		})
 	}
 }
 

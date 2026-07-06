@@ -223,6 +223,10 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 }
 
 func quotaPriorityWindowExhaustedUntil(auth *Auth, now time.Time, window time.Duration) (time.Time, bool) {
+	return quotaPriorityTargetWindowExhaustedUntil(auth, now, window)
+}
+
+func quotaPriorityTargetWindowExhaustedUntil(auth *Auth, now time.Time, window time.Duration) (time.Time, bool) {
 	windowScore, ok := bestQuotaWindowScore(auth, now, window)
 	if !ok || !windowScore.ResetAt.After(now) {
 		return time.Time{}, false
@@ -231,6 +235,53 @@ func quotaPriorityWindowExhaustedUntil(auth *Auth, now time.Time, window time.Du
 		return time.Time{}, false
 	}
 	return windowScore.ResetAt, true
+}
+
+func quotaAvailabilityBlockedUntil(auth *Auth, now time.Time, quotaExhaustionWindow time.Duration) (time.Time, bool) {
+	if auth == nil {
+		return time.Time{}, false
+	}
+	var latest time.Time
+	if quotaExhaustionWindow > 0 {
+		if resetAt, exhausted := quotaPriorityTargetWindowExhaustedUntil(auth, now, quotaExhaustionWindow); exhausted {
+			latest = laterTime(latest, resetAt)
+		}
+	}
+	for windowName, threshold := range OAuthMinimumQuotaPercentFromAttributes(auth.Attributes) {
+		duration, okDuration := oauthMinimumQuotaWindowDuration(windowName)
+		if !okDuration || threshold <= 0 {
+			continue
+		}
+		windowScore, okScore := bestQuotaWindowScore(auth, now, duration)
+		if !okScore || !windowScore.ResetAt.After(now) {
+			continue
+		}
+		if windowScore.RemainingPercent < threshold {
+			latest = laterTime(latest, windowScore.ResetAt)
+		}
+	}
+	return latest, !latest.IsZero()
+}
+
+func oauthMinimumQuotaWindowDuration(window string) (time.Duration, bool) {
+	switch window {
+	case "5h":
+		return 5 * time.Hour, true
+	case "week":
+		return 7 * 24 * time.Hour, true
+	default:
+		return 0, false
+	}
+}
+
+func laterTime(current, candidate time.Time) time.Time {
+	if candidate.IsZero() {
+		return current
+	}
+	if current.IsZero() || candidate.After(current) {
+		return candidate
+	}
+	return current
 }
 
 func isCodexAuth(auth *Auth) bool {
@@ -379,14 +430,12 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time, quot
 		candidate := auths[i]
 		blocked, reason, next := isAuthBlockedForModel(candidate, model, now)
 		if !blocked {
-			if quotaExhaustionWindow > 0 {
-				if resetAt, exhausted := quotaPriorityWindowExhaustedUntil(candidate, now, quotaExhaustionWindow); exhausted {
-					cooldownCount++
-					if earliest.IsZero() || resetAt.Before(earliest) {
-						earliest = resetAt
-					}
-					continue
+			if resetAt, quotaBlocked := quotaAvailabilityBlockedUntil(candidate, now, quotaExhaustionWindow); quotaBlocked {
+				cooldownCount++
+				if earliest.IsZero() || resetAt.Before(earliest) {
+					earliest = resetAt
 				}
+				continue
 			}
 			priority := authPriority(candidate)
 			available[priority] = append(available[priority], candidate)

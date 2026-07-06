@@ -292,10 +292,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	}
 	now := time.Now()
 	shard.promoteExpiredLocked(now)
-	selectionPredicate := predicate
-	if strategy == schedulerStrategyQuota {
-		selectionPredicate = quotaPriorityScheduledPredicate(now, s.quotaWindow, predicate)
-	}
+	selectionPredicate := quotaAvailabilityScheduledPredicate(now, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow), predicate)
 	priorityReady, okPriority := shard.highestReadyPriorityLocked(preferWebsocket, selectionPredicate)
 	if okPriority && entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		entries := shard.entriesAtPriorityLocked(preferWebsocket, priorityReady)
@@ -314,7 +311,7 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		entry.Debugf("routing scheduler: no ready auth selected | provider=%s model=%s strategy=%s minimum_quota_percent=%.2f", providerKey, model, schedulerStrategyLogName(strategy), s.minimumQuotaPercent)
 	}
-	return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	return nil, shard.unavailableErrorLocked(provider, model, predicate, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 }
 
 func providerPrefersWebsocketTransport(providerKey string) bool {
@@ -383,10 +380,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		now := time.Now()
 		shard.promoteExpiredLocked(now)
-		selectionPredicate := predicate
-		if strategy == schedulerStrategyQuota {
-			selectionPredicate = quotaPriorityScheduledPredicate(now, s.quotaWindow, predicate)
-		}
+		selectionPredicate := quotaAvailabilityScheduledPredicate(now, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow), predicate)
 		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, selectionPredicate)
 		if okPriority && entry.Logger.IsLevelEnabled(log.DebugLevel) {
 			entries := shard.entriesAtPriorityLocked(false, priorityReady)
@@ -406,7 +400,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			entry.Debugf("routing scheduler: no ready auth selected | provider=%s model=%s strategy=%s pinned_auth=%s minimum_quota_percent=%.2f",
 				providerKey, model, schedulerStrategyLogName(strategy), pinnedAuthID, s.minimumQuotaPercent)
 		}
-		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
+		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 	}
 
 	predicate := triedPredicate(tried)
@@ -414,10 +408,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	bestPriority := 0
 	hasCandidate := false
 	now := time.Now()
-	selectionPredicate := predicate
-	if strategy == schedulerStrategyQuota {
-		selectionPredicate = quotaPriorityScheduledPredicate(now, s.quotaWindow, predicate)
-	}
+	selectionPredicate := quotaAvailabilityScheduledPredicate(now, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow), predicate)
 	for providerIndex, providerKey := range normalized {
 		providerState := s.providers[providerKey]
 		if providerState == nil {
@@ -438,7 +429,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if !hasCandidate {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 	}
 	globalPredicate := s.mixedMinimumQuotaPredicateLocked(candidateShards, bestPriority, s.minimumQuotaPercent, selectionPredicate)
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
@@ -461,7 +452,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 				return picked, providerKey, nil
 			}
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 	}
 
 	if strategy == schedulerStrategyQuota {
@@ -523,7 +514,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		segmentEnds[providerIndex] = totalWeight
 	}
 	if totalWeight == 0 {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 	}
 
 	startSlot := s.mixedCursors[cursorKey] % totalWeight
@@ -538,7 +529,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if startProviderIndex < 0 {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 	}
 
 	slot := startSlot
@@ -565,7 +556,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, slot, s.minimumQuotaPercent, winningWindow, resetIn, quota, score, multiplier)
 		return picked, providerKey, nil
 	}
-	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried, quotaExhaustionWindowForStrategy(strategy, s.quotaWindow))
 }
 
 func schedulerStrategyLogName(strategy schedulerStrategy) string {
@@ -625,7 +616,7 @@ func (s *authScheduler) mixedMinimumQuotaPredicateLocked(shards []*modelSchedule
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
-func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
+func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}, quotaExhaustionWindow time.Duration) error {
 	now := time.Now()
 	total := 0
 	cooldownCount := 0
@@ -639,7 +630,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried), now, quotaExhaustionWindow)
 		total += localTotal
 		cooldownCount += localCooldownCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
@@ -1088,9 +1079,9 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
-func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
+func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool, quotaExhaustionWindow time.Duration) error {
 	now := time.Now()
-	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate)
+	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate, now, quotaExhaustionWindow)
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -1109,7 +1100,7 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 }
 
 // availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
-func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool) (int, int, time.Time) {
+func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool, now time.Time, quotaExhaustionWindow time.Duration) (int, int, time.Time) {
 	if m == nil {
 		return 0, 0, time.Time{}
 	}
@@ -1124,12 +1115,18 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown {
+		nextRetryAt := time.Time{}
+		if entry.state == scheduledStateCooldown {
+			nextRetryAt = entry.nextRetryAt
+		} else if resetAt, quotaBlocked := quotaAvailabilityBlockedUntil(entry.auth, now, quotaExhaustionWindow); quotaBlocked {
+			nextRetryAt = resetAt
+		}
+		if nextRetryAt.IsZero() {
 			continue
 		}
 		cooldownCount++
-		if !entry.nextRetryAt.IsZero() && (earliest.IsZero() || entry.nextRetryAt.Before(earliest)) {
-			earliest = entry.nextRetryAt
+		if earliest.IsZero() || nextRetryAt.Before(earliest) {
+			earliest = nextRetryAt
 		}
 	}
 	return total, cooldownCount, earliest
@@ -1339,7 +1336,14 @@ func minimumQuotaScheduledPredicate(entries []*scheduledAuth, threshold float64,
 	}
 }
 
-func quotaPriorityScheduledPredicate(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
+func quotaExhaustionWindowForStrategy(strategy schedulerStrategy, window time.Duration) time.Duration {
+	if strategy == schedulerStrategyQuota {
+		return window
+	}
+	return 0
+}
+
+func quotaAvailabilityScheduledPredicate(now time.Time, quotaExhaustionWindow time.Duration, predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
 	return func(entry *scheduledAuth) bool {
 		if predicate != nil && !predicate(entry) {
 			return false
@@ -1347,7 +1351,7 @@ func quotaPriorityScheduledPredicate(now time.Time, window time.Duration, predic
 		if entry == nil || entry.auth == nil {
 			return false
 		}
-		_, exhausted := quotaPriorityWindowExhaustedUntil(entry.auth, now, window)
-		return !exhausted
+		_, blocked := quotaAvailabilityBlockedUntil(entry.auth, now, quotaExhaustionWindow)
+		return !blocked
 	}
 }

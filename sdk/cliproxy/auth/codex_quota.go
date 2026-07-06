@@ -229,5 +229,5 @@ func logCodexQuotaUpdate(ctx context.Context, authID string, summary codexQuotaU
 		parts = append(parts, fmt.Sprintf("%s=%.2f%% reset_in=%s", window.Name, window.RemainingPercent, resetIn.Round(time.Second)))
 	}
 	entry := logEntryWithRequestID(ctx).WithField("auth", authID)
-	entry.Infof("codex quota updated | plan_type=%s windows=%s", summary.PlanType, strings.Join(parts, " "))
+	entry.Infof("codex quota updated | auth=%s plan_type=%s windows=%s", authID, summary.PlanType, strings.Join(parts, " "))
 }
