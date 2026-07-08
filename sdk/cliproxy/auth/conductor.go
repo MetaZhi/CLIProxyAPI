@@ -87,6 +87,11 @@ const (
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
 	transientErrorCooldown    = time.Minute
+
+	networkRetryStormWindow           = 10 * time.Second
+	networkRetryStormCooldown         = 20 * time.Second
+	networkRetryStormFailureThreshold = 8
+	networkRetrySuppressedErrorCode   = "network_retry_suppressed"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -240,6 +245,7 @@ type Manager struct {
 	sameAuthNetworkRetry atomic.Int32
 	maxRetryCredentials  atomic.Int32
 	maxRetryInterval     atomic.Int64
+	networkRetryStorm    *networkRetryStormGuard
 
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
@@ -282,12 +288,254 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeRuntimeAuths: make(map[string]map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
+		networkRetryStorm: newNetworkRetryStormGuard(
+			networkRetryStormFailureThreshold,
+			networkRetryStormWindow,
+			networkRetryStormCooldown,
+		),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+type networkRetryStormGuard struct {
+	mu        sync.Mutex
+	buckets   map[string]*networkRetryStormBucket
+	threshold int
+	window    time.Duration
+	cooldown  time.Duration
+	now       func() time.Time
+}
+
+type networkRetryStormBucket struct {
+	failures  []time.Time
+	openUntil time.Time
+	probing   bool
+}
+
+func newNetworkRetryStormGuard(threshold int, window, cooldown time.Duration) *networkRetryStormGuard {
+	if threshold <= 0 || window <= 0 || cooldown <= 0 {
+		return nil
+	}
+	return &networkRetryStormGuard{
+		buckets:   make(map[string]*networkRetryStormBucket),
+		threshold: threshold,
+		window:    window,
+		cooldown:  cooldown,
+		now:       time.Now,
+	}
+}
+
+func (m *Manager) networkRetryStormBefore(ctx context.Context, auth *Auth, provider, model, stage string) error {
+	if m == nil || m.networkRetryStorm == nil {
+		return nil
+	}
+	return m.networkRetryStorm.before(ctx, auth, provider, model, stage)
+}
+
+func (m *Manager) recordNetworkRetryStormFailure(ctx context.Context, auth *Auth, provider, model, stage, class string, err error) error {
+	if m == nil || m.networkRetryStorm == nil {
+		return nil
+	}
+	return m.networkRetryStorm.recordFailure(ctx, auth, provider, model, stage, class, err)
+}
+
+func (m *Manager) recordNetworkRetryStormSuccess(ctx context.Context, auth *Auth, provider, model, stage string) {
+	if m == nil || m.networkRetryStorm == nil {
+		return
+	}
+	m.networkRetryStorm.recordSuccess(ctx, auth, provider, model, stage)
+}
+
+func (g *networkRetryStormGuard) before(ctx context.Context, auth *Auth, provider, model, stage string) error {
+	if g == nil {
+		return nil
+	}
+	key, proxyKind := networkRetryStormBucketKey(auth, provider)
+	now := g.currentTime()
+
+	g.mu.Lock()
+	bucket := g.bucketLocked(key)
+	if bucket.openUntil.After(now) {
+		openUntil := bucket.openUntil
+		g.mu.Unlock()
+		logNetworkRetryStormSuppressed(ctx, provider, model, stage, proxyKind, openUntil)
+		return newNetworkRetrySuppressedError(provider)
+	}
+	if !bucket.openUntil.IsZero() {
+		if bucket.probing {
+			g.mu.Unlock()
+			logNetworkRetryStormSuppressed(ctx, provider, model, stage, proxyKind, bucket.openUntil)
+			return newNetworkRetrySuppressedError(provider)
+		}
+		bucket.probing = true
+		g.mu.Unlock()
+		logNetworkRetryStormProbe(ctx, provider, model, stage, proxyKind)
+		return nil
+	}
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *networkRetryStormGuard) recordFailure(ctx context.Context, auth *Auth, provider, model, stage, class string, err error) error {
+	if g == nil {
+		return nil
+	}
+	key, proxyKind := networkRetryStormBucketKey(auth, provider)
+	now := g.currentTime()
+
+	g.mu.Lock()
+	bucket := g.bucketLocked(key)
+	if bucket.probing {
+		bucket.probing = false
+		bucket.failures = []time.Time{now}
+		bucket.openUntil = now.Add(g.cooldown)
+		openUntil := bucket.openUntil
+		g.mu.Unlock()
+		logNetworkRetryStormOpened(ctx, provider, model, stage, proxyKind, class, err, openUntil, true)
+		return newNetworkRetrySuppressedError(provider)
+	}
+
+	cutoff := now.Add(-g.window)
+	kept := bucket.failures[:0]
+	for _, ts := range bucket.failures {
+		if !ts.Before(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	bucket.failures = append(kept, now)
+	if len(bucket.failures) >= g.threshold && !bucket.openUntil.After(now) {
+		bucket.openUntil = now.Add(g.cooldown)
+		openUntil := bucket.openUntil
+		g.mu.Unlock()
+		logNetworkRetryStormOpened(ctx, provider, model, stage, proxyKind, class, err, openUntil, false)
+		return newNetworkRetrySuppressedError(provider)
+	}
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *networkRetryStormGuard) recordSuccess(ctx context.Context, auth *Auth, provider, model, stage string) {
+	if g == nil {
+		return
+	}
+	key, proxyKind := networkRetryStormBucketKey(auth, provider)
+
+	g.mu.Lock()
+	bucket := g.buckets[key]
+	if bucket == nil {
+		g.mu.Unlock()
+		return
+	}
+	wasOpen := !bucket.openUntil.IsZero() || bucket.probing
+	delete(g.buckets, key)
+	g.mu.Unlock()
+	if wasOpen {
+		logNetworkRetryStormClosed(ctx, provider, model, stage, proxyKind)
+	}
+}
+
+func (g *networkRetryStormGuard) bucketLocked(key string) *networkRetryStormBucket {
+	bucket := g.buckets[key]
+	if bucket == nil {
+		bucket = &networkRetryStormBucket{}
+		g.buckets[key] = bucket
+	}
+	return bucket
+}
+
+func (g *networkRetryStormGuard) currentTime() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
+func networkRetryStormBucketKey(auth *Auth, provider string) (string, string) {
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if providerKey == "" && auth != nil {
+		providerKey = strings.ToLower(strings.TrimSpace(auth.Provider))
+	}
+	if providerKey == "" {
+		providerKey = "unknown"
+	}
+	proxy := ""
+	if auth != nil {
+		proxy = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxy == "" {
+		return providerKey + "|direct", "direct"
+	}
+	return providerKey + "|proxy|" + proxy, "custom_proxy"
+}
+
+func newNetworkRetrySuppressedError(provider string) *Error {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = "upstream"
+	}
+	return &Error{
+		Code:       networkRetrySuppressedErrorCode,
+		Message:    fmt.Sprintf("network retry storm active for provider %s", provider),
+		Retryable:  true,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
+func isNetworkRetrySuppressedError(err error) bool {
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == networkRetrySuppressedErrorCode
+}
+
+func networkRetryStormLogEntry(ctx context.Context) *log.Entry {
+	entry := logEntryWithRequestID(ctx)
+	if entry != nil {
+		return entry
+	}
+	return log.NewEntry(log.StandardLogger())
+}
+
+func logNetworkRetryStormOpened(ctx context.Context, provider, model, stage, proxyKind, class string, err error, openUntil time.Time, probe bool) {
+	networkRetryStormLogEntry(ctx).WithFields(log.Fields{
+		"provider":        provider,
+		"model":           model,
+		"stage":           stage,
+		"proxy":           proxyKind,
+		"error_class":     class,
+		"open_until":      openUntil.Format(time.RFC3339),
+		"half_open_probe": probe,
+	}).WithError(err).Warn("network retry storm opened")
+}
+
+func logNetworkRetryStormSuppressed(ctx context.Context, provider, model, stage, proxyKind string, openUntil time.Time) {
+	networkRetryStormLogEntry(ctx).WithFields(log.Fields{
+		"provider":   provider,
+		"model":      model,
+		"stage":      stage,
+		"proxy":      proxyKind,
+		"open_until": openUntil.Format(time.RFC3339),
+	}).Warn("network retry storm suppressed")
+}
+
+func logNetworkRetryStormProbe(ctx context.Context, provider, model, stage, proxyKind string) {
+	networkRetryStormLogEntry(ctx).WithFields(log.Fields{
+		"provider": provider,
+		"model":    model,
+		"stage":    stage,
+		"proxy":    proxyKind,
+	}).Info("network retry storm probe")
+}
+
+func logNetworkRetryStormClosed(ctx context.Context, provider, model, stage, proxyKind string) {
+	networkRetryStormLogEntry(ctx).WithFields(log.Fields{
+		"provider": provider,
+		"model":    model,
+		"stage":    stage,
+		"proxy":    proxyKind,
+	}).Info("network retry storm closed")
 }
 
 func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
@@ -1898,12 +2146,25 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		for sameAttempt := 0; ; sameAttempt++ {
+			if errStorm := m.networkRetryStormBefore(ctx, auth, provider, resultModel, "stream-open"); errStorm != nil {
+				return nil, errStorm
+			}
 			streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 			if errStream != nil {
 				if errCtx := ctx.Err(); errCtx != nil {
 					return nil, errCtx
 				}
 				if retryable, class := sameAuthNetworkRetryableError(errStream); retryable {
+					if errStorm := m.recordNetworkRetryStormFailure(ctx, auth, provider, resultModel, "stream-open", class, errStream); errStorm != nil {
+						rerr := &Error{Message: errStream.Error()}
+						if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+							rerr.HTTPStatus = se.StatusCode()
+						}
+						result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+						result.RetryAfter = retryAfterFromError(errStream)
+						m.MarkResult(ctx, result)
+						return nil, errStorm
+					}
 					if sameAttempt < sameAuthNetworkRetry {
 						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-open", sameAttempt+1, sameAuthNetworkRetry, class, errStream)
 						continue
@@ -1933,6 +2194,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					return nil, errCtx
 				}
 				if retryable, class := sameAuthNetworkRetryableError(bootstrapErr); retryable {
+					if errStorm := m.recordNetworkRetryStormFailure(ctx, auth, provider, resultModel, "stream-bootstrap", class, bootstrapErr); errStorm != nil {
+						rerr := &Error{Message: bootstrapErr.Error()}
+						if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
+							rerr.HTTPStatus = se.StatusCode()
+						}
+						result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+						result.RetryAfter = retryAfterFromError(bootstrapErr)
+						m.MarkResult(ctx, result)
+						discardStreamChunks(streamResult.Chunks)
+						return nil, errStorm
+					}
 					if sameAttempt < sameAuthNetworkRetry {
 						discardStreamChunks(streamResult.Chunks)
 						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-bootstrap", sameAttempt+1, sameAuthNetworkRetry, class, bootstrapErr)
@@ -1979,6 +2251,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if closed && len(buffered) == 0 {
 				emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 				if retryable, class := sameAuthNetworkRetryableError(emptyErr); retryable {
+					if errStorm := m.recordNetworkRetryStormFailure(ctx, auth, provider, resultModel, "stream-empty", class, emptyErr); errStorm != nil {
+						result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+						m.MarkResult(ctx, result)
+						return nil, errStorm
+					}
 					if sameAttempt < sameAuthNetworkRetry {
 						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-empty", sameAttempt+1, sameAuthNetworkRetry, class, emptyErr)
 						continue
@@ -2002,6 +2279,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				close(closedCh)
 				remaining = closedCh
 			}
+			m.recordNetworkRetryStormSuccess(ctx, auth, provider, resultModel, "stream-bootstrap")
 			return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, aliasResult), nil
 		}
 	}
@@ -2645,6 +2923,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			for sameAttempt := 0; ; sameAttempt++ {
+				if errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "execute"); errStorm != nil {
+					return cliproxyexecutor.Response{}, errStorm
+				}
 				resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 				if errExec != nil {
@@ -2652,6 +2933,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						return cliproxyexecutor.Response{}, errCtx
 					}
 					if retryable, class := sameAuthNetworkRetryableError(errExec); retryable {
+						if errStorm := m.recordNetworkRetryStormFailure(execCtx, auth, provider, resultModel, "execute", class, errExec); errStorm != nil {
+							result.Error = &Error{Message: errExec.Error()}
+							m.MarkResult(execCtx, result)
+							return cliproxyexecutor.Response{}, errStorm
+						}
 						if sameAttempt < sameAuthNetworkRetry {
 							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "execute", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
 							continue
@@ -2675,6 +2961,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					break
 				}
 				result.Headers = resp.Headers
+				m.recordNetworkRetryStormSuccess(execCtx, auth, provider, resultModel, "execute")
 				m.MarkResult(execCtx, result)
 				rewriteForceMappedResponse(&resp, aliasResult)
 				return resp, nil
@@ -2760,6 +3047,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			for sameAttempt := 0; ; sameAttempt++ {
+				if errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "count"); errStorm != nil {
+					return cliproxyexecutor.Response{}, errStorm
+				}
 				resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 				if errExec != nil {
@@ -2767,6 +3057,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						return cliproxyexecutor.Response{}, errCtx
 					}
 					if retryable, class := sameAuthNetworkRetryableError(errExec); retryable {
+						if errStorm := m.recordNetworkRetryStormFailure(execCtx, auth, provider, resultModel, "count", class, errExec); errStorm != nil {
+							result.Error = &Error{Message: errExec.Error()}
+							m.MarkResult(execCtx, result)
+							return cliproxyexecutor.Response{}, errStorm
+						}
 						if sameAttempt < sameAuthNetworkRetry {
 							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "count", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
 							continue
@@ -2789,6 +3084,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					authErr = errExec
 					break
 				}
+				m.recordNetworkRetryStormSuccess(execCtx, auth, provider, resultModel, "count")
 				m.MarkResult(execCtx, result)
 				rewriteForceMappedResponse(&resp, aliasResult)
 				return resp, nil
@@ -2868,6 +3164,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
+			}
+			if isNetworkRetrySuppressedError(errStream) {
+				return nil, errStream
 			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
@@ -3718,6 +4017,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	if maxWait <= 0 {
+		return 0, false
+	}
+	if isNetworkRetrySuppressedError(err) {
 		return 0, false
 	}
 	status := statusCodeFromError(err)

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
@@ -443,6 +444,26 @@ func newSameAuthNetworkRetryTestManager(t *testing.T, sameAuthRetry, maxRetryCre
 	return m
 }
 
+func setTestNetworkRetryStormGuard(m *Manager, threshold int, now *time.Time) {
+	guard := newNetworkRetryStormGuard(threshold, time.Second, time.Second)
+	guard.now = func() time.Time { return *now }
+	m.networkRetryStorm = guard
+}
+
+func requireNetworkRetrySuppressed(t *testing.T, err error) {
+	t.Helper()
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		t.Fatalf("error = %v, want *Error %s", err, networkRetrySuppressedErrorCode)
+	}
+	if authErr.Code != networkRetrySuppressedErrorCode {
+		t.Fatalf("error code = %q, want %q", authErr.Code, networkRetrySuppressedErrorCode)
+	}
+	if authErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("http status = %d, want %d", authErr.HTTPStatus, http.StatusServiceUnavailable)
+	}
+}
+
 func TestManager_SameAuthNetworkRetryRetriesSameAuthBeforeSwitching(t *testing.T) {
 	base := uuid.NewString()
 	auth1 := "aa-" + base
@@ -528,6 +549,102 @@ func TestManager_SameAuthNetworkRetryRespectsMaxRetryCredentialsOne(t *testing.T
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManager_NetworkRetryStormSuppressesSubsequentRequests(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	auth2 := "bb-" + base
+	now := time.Unix(1000, 0)
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {io.ErrUnexpectedEOF, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 2, 2, executor, auth1, auth2)
+	setTestNetworkRetryStormGuard(m, 3, &now)
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	requireNetworkRetrySuppressed(t, errExecute)
+	got := executor.ExecuteCalls()
+	want := []string{auth1, auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	_, errExecute = m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	requireNetworkRetrySuppressed(t, errExecute)
+	got = executor.ExecuteCalls()
+	if len(got) != len(want) {
+		t.Fatalf("execute calls after suppressed request = %v, want still %v", got, want)
+	}
+}
+
+func TestManager_NetworkRetryStormHalfOpenSuccessClosesStorm(t *testing.T) {
+	base := uuid.NewString()
+	auth1 := "aa-" + base
+	now := time.Unix(2000, 0)
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			auth1: {io.ErrUnexpectedEOF},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 0, 1, executor, auth1)
+	setTestNetworkRetryStormGuard(m, 1, &now)
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	requireNetworkRetrySuppressed(t, errExecute)
+	got := executor.ExecuteCalls()
+	want := []string{auth1}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+
+	_, errExecute = m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	requireNetworkRetrySuppressed(t, errExecute)
+	got = executor.ExecuteCalls()
+	if len(got) != len(want) {
+		t.Fatalf("execute calls during open storm = %v, want still %v", got, want)
+	}
+
+	now = now.Add(2 * time.Second)
+	resp, errExecute := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("half-open execute error = %v, want success", errExecute)
+	}
+	if string(resp.Payload) != auth1 {
+		t.Fatalf("half-open payload = %q, want %q", string(resp.Payload), auth1)
+	}
+	got = executor.ExecuteCalls()
+	want = []string{auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls after half-open = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	resp, errExecute = m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute after closed storm error = %v, want success", errExecute)
+	}
+	if string(resp.Payload) != auth1 {
+		t.Fatalf("payload after closed storm = %q, want %q", string(resp.Payload), auth1)
+	}
+	got = executor.ExecuteCalls()
+	want = []string{auth1, auth1, auth1}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls after closed storm = %v, want %v", got, want)
 	}
 }
 
