@@ -256,6 +256,7 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 			}
 			hasPerAccountMinimumQuotaPercent := cliproxyauth.OAuthMinimumQuotaPercentMetadataPresent(metadata)
 			perAccountMinimumQuotaPercent := cliproxyauth.OAuthMinimumQuotaPercentFromMetadata(metadata)
+			disabled, _ := metadata["disabled"].(bool)
 			for index, auth := range auths {
 				if auth == nil {
 					continue
@@ -271,6 +272,14 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 				auth.Attributes[cliproxyauth.AttributePath] = path
 				auth.Attributes[cliproxyauth.AttributeSource] = path
 				auth.Attributes[cliproxyauth.AttributeSourceBackend] = cliproxyauth.AuthSourceFile
+				if disabled {
+					auth.Disabled = true
+					auth.Status = cliproxyauth.StatusDisabled
+					if auth.Metadata == nil {
+						auth.Metadata = make(map[string]any)
+					}
+					auth.Metadata["disabled"] = true
+				}
 				if hasPerAccountMinimumQuotaPercent {
 					cliproxyauth.SetOAuthMinimumQuotaPercentAttribute(auth, perAccountMinimumQuotaPercent)
 				}

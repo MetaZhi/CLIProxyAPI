@@ -1236,6 +1236,59 @@ func TestClaudeExecutor_ExecuteStreamStripsOpenAIEncryptedThinkingBeforeUpstream
 	}
 }
 
+func TestClaudeExecutor_ExecuteStreamDirectPassthroughEmitsCompleteSSEEvents(t *testing.T) {
+	firstData := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`
+	secondData := `{"type":"message_stop"}`
+	upstreamStream := "event: content_block_delta\n" +
+		"data: " + firstData + "\n" +
+		"\n" +
+		"event: message_stop\n" +
+		"data: " + secondData + "\n" +
+		"\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(upstreamStream))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var payloads []string
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		payloads = append(payloads, string(chunk.Payload))
+	}
+
+	want := []string{
+		"event: content_block_delta\n" + "data: " + firstData + "\n\n",
+		"event: message_stop\n" + "data: " + secondData + "\n\n",
+	}
+	if len(payloads) != len(want) {
+		t.Fatalf("payload count = %d, want %d: %#v", len(payloads), len(want), payloads)
+	}
+	for i := range want {
+		if payloads[i] != want[i] {
+			t.Fatalf("payload[%d] = %q, want %q", i, payloads[i], want[i])
+		}
+	}
+}
+
 func TestClaudeExecutor_CountTokensStripsOpenAIEncryptedThinkingBeforeUpstream(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2885,5 +2938,44 @@ func TestRestoreClaudeOAuthToolNamesFromStreamLine_MixedCaseWithPrefix(t *testin
 	out = restoreClaudeOAuthToolNamesFromStreamLine(globLine, "proxy_", false, reverseMap)
 	if !bytes.Contains(out, []byte(`"name":"glob"`)) {
 		t.Fatalf("Glob should be restored to glob, got: %s", string(out))
+	}
+}
+
+func TestEnsureClaudeThinkingDisplay_SetsSummarizedWhenMissing(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`)
+	out := ensureClaudeThinkingDisplay(payload)
+
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "summarized" {
+		t.Fatalf("thinking.display = %q, want summarized", got)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive", got)
+	}
+}
+
+func TestEnsureClaudeThinkingDisplay_PreservesExplicitValue(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"enabled","budget_tokens":2048,"display":"omitted"}}`)
+	out := ensureClaudeThinkingDisplay(payload)
+
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "omitted" {
+		t.Fatalf("thinking.display = %q, want omitted", got)
+	}
+}
+
+func TestEnsureClaudeThinkingDisplay_SkipsWhenThinkingDisabled(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"disabled"}}`)
+	out := ensureClaudeThinkingDisplay(payload)
+
+	if gjson.GetBytes(out, "thinking.display").Exists() {
+		t.Fatalf("thinking.display should not be set when thinking is disabled: %s", out)
+	}
+}
+
+func TestEnsureClaudeThinkingDisplay_SkipsWhenThinkingMissing(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	out := ensureClaudeThinkingDisplay(payload)
+
+	if gjson.GetBytes(out, "thinking").Exists() {
+		t.Fatalf("thinking should remain absent: %s", out)
 	}
 }
