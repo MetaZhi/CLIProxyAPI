@@ -232,8 +232,10 @@ type sameAuthNetworkRetryExecutor struct {
 	mu            sync.Mutex
 	executeCalls  []string
 	executeErrors map[string][]error
+	executeHook   func(int, context.Context)
 	streamCalls   []string
 	streamPlans   map[string][]sameAuthNetworkRetryStreamPlan
+	streamHook    func(int, context.Context)
 }
 
 type sameAuthNetworkRetryStreamPlan struct {
@@ -245,30 +247,38 @@ func (e *sameAuthNetworkRetryExecutor) Identifier() string {
 	return e.id
 }
 
-func (e *sameAuthNetworkRetryExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *sameAuthNetworkRetryExecutor) Execute(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.mu.Lock()
 	e.executeCalls = append(e.executeCalls, auth.ID)
+	call := len(e.executeCalls)
 	var err error
 	if queue := e.executeErrors[auth.ID]; len(queue) > 0 {
 		err = queue[0]
 		e.executeErrors[auth.ID] = queue[1:]
 	}
 	e.mu.Unlock()
+	if e.executeHook != nil {
+		e.executeHook(call, ctx)
+	}
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 	return cliproxyexecutor.Response{Payload: []byte(auth.ID), Headers: http.Header{"X-Auth": {auth.ID}}}, nil
 }
 
-func (e *sameAuthNetworkRetryExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *sameAuthNetworkRetryExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	e.mu.Lock()
 	e.streamCalls = append(e.streamCalls, auth.ID)
+	call := len(e.streamCalls)
 	plan := sameAuthNetworkRetryStreamPlan{chunks: []cliproxyexecutor.StreamChunk{{Payload: []byte(auth.ID)}}}
 	if queue := e.streamPlans[auth.ID]; len(queue) > 0 {
 		plan = queue[0]
 		e.streamPlans[auth.ID] = queue[1:]
 	}
 	e.mu.Unlock()
+	if e.streamHook != nil {
+		e.streamHook(call, ctx)
+	}
 	if plan.openErr != nil {
 		return nil, plan.openErr
 	}
@@ -645,6 +655,124 @@ func TestManager_NetworkRetryStormHalfOpenSuccessClosesStorm(t *testing.T) {
 	want = []string{auth1, auth1, auth1}
 	if len(got) != len(want) {
 		t.Fatalf("execute calls after closed storm = %v, want %v", got, want)
+	}
+}
+
+func TestManager_NetworkRetryStormCanceledHalfOpenProbeIsReleased(t *testing.T) {
+	testCases := []struct {
+		name   string
+		stream bool
+		invoke func(*Manager, context.Context, cliproxyexecutor.Request) error
+		calls  func(*sameAuthNetworkRetryExecutor) int
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager, ctx context.Context, req cliproxyexecutor.Request) error {
+				_, errExecute := m.Execute(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(e *sameAuthNetworkRetryExecutor) int { return len(e.ExecuteCalls()) },
+		},
+		{
+			name: "count",
+			invoke: func(m *Manager, ctx context.Context, req cliproxyexecutor.Request) error {
+				_, errExecute := m.ExecuteCount(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(e *sameAuthNetworkRetryExecutor) int { return len(e.ExecuteCalls()) },
+		},
+		{
+			name:   "stream",
+			stream: true,
+			invoke: func(m *Manager, ctx context.Context, req cliproxyexecutor.Request) error {
+				_, errExecute := m.ExecuteStream(ctx, []string{"claude"}, req, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(e *sameAuthNetworkRetryExecutor) int { return len(e.StreamCalls()) },
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			base := uuid.NewString()
+			authID := "auth-" + base
+			now := time.Unix(3000, 0)
+			executor := &sameAuthNetworkRetryExecutor{id: "claude"}
+			if tc.stream {
+				executor.streamPlans = map[string][]sameAuthNetworkRetryStreamPlan{
+					authID: {{openErr: io.ErrUnexpectedEOF}, {openErr: io.ErrUnexpectedEOF}},
+				}
+			} else {
+				executor.executeErrors = map[string][]error{
+					authID: {io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+				}
+			}
+			m := newSameAuthNetworkRetryTestManager(t, 0, 1, executor, authID)
+			setTestNetworkRetryStormGuard(m, 1, &now)
+			req := cliproxyexecutor.Request{Model: "test-model"}
+
+			requireNetworkRetrySuppressed(t, tc.invoke(m, context.Background(), req))
+			now = now.Add(2 * time.Second)
+
+			probeCtx, cancelProbe := context.WithCancel(context.Background())
+			if tc.stream {
+				executor.streamHook = func(call int, _ context.Context) {
+					if call == 2 {
+						cancelProbe()
+					}
+				}
+			} else {
+				executor.executeHook = func(call int, _ context.Context) {
+					if call == 2 {
+						cancelProbe()
+					}
+				}
+			}
+			errProbe := tc.invoke(m, probeCtx, req)
+			if !errors.Is(errProbe, context.Canceled) {
+				t.Fatalf("canceled half-open probe error = %v, want context canceled", errProbe)
+			}
+
+			if errExecute := tc.invoke(m, context.Background(), req); errExecute != nil {
+				t.Fatalf("request after canceled probe error = %v, want success", errExecute)
+			}
+			if calls := tc.calls(executor); calls != 3 {
+				t.Fatalf("executor calls = %d, want 3", calls)
+			}
+		})
+	}
+}
+
+func TestManager_NetworkRetryStormNonRetryableHalfOpenProbeIsReleased(t *testing.T) {
+	base := uuid.NewString()
+	authID := "auth-" + base
+	now := time.Unix(4000, 0)
+	permanentErr := errors.New("permanent upstream failure")
+	executor := &sameAuthNetworkRetryExecutor{
+		id: "claude",
+		executeErrors: map[string][]error{
+			authID: {io.ErrUnexpectedEOF, permanentErr},
+		},
+	}
+	m := newSameAuthNetworkRetryTestManager(t, 0, 1, executor, authID)
+	setTestNetworkRetryStormGuard(m, 1, &now)
+	req := cliproxyexecutor.Request{Model: "test-model"}
+
+	_, errExecute := m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	requireNetworkRetrySuppressed(t, errExecute)
+	now = now.Add(2 * time.Second)
+
+	_, errExecute = m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{})
+	if !errors.Is(errExecute, permanentErr) {
+		t.Fatalf("non-retryable half-open probe error = %v, want %v", errExecute, permanentErr)
+	}
+
+	if _, errExecute = m.Execute(context.Background(), []string{"claude"}, req, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("request after non-retryable probe error = %v, want success", errExecute)
+	}
+	if calls := len(executor.ExecuteCalls()); calls != 3 {
+		t.Fatalf("execute calls = %d, want 3", calls)
 	}
 }
 

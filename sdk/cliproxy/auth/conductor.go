@@ -333,11 +333,18 @@ func newNetworkRetryStormGuard(threshold int, window, cooldown time.Duration) *n
 	}
 }
 
-func (m *Manager) networkRetryStormBefore(ctx context.Context, auth *Auth, provider, model, stage string) error {
+func (m *Manager) networkRetryStormBefore(ctx context.Context, auth *Auth, provider, model, stage string) (bool, error) {
 	if m == nil || m.networkRetryStorm == nil {
-		return nil
+		return false, nil
 	}
 	return m.networkRetryStorm.before(ctx, auth, provider, model, stage)
+}
+
+func (m *Manager) releaseNetworkRetryStormProbe(auth *Auth, provider string) {
+	if m == nil || m.networkRetryStorm == nil {
+		return
+	}
+	m.networkRetryStorm.releaseProbe(auth, provider)
 }
 
 func (m *Manager) recordNetworkRetryStormFailure(ctx context.Context, auth *Auth, provider, model, stage, class string, err error) error {
@@ -354,9 +361,9 @@ func (m *Manager) recordNetworkRetryStormSuccess(ctx context.Context, auth *Auth
 	m.networkRetryStorm.recordSuccess(ctx, auth, provider, model, stage)
 }
 
-func (g *networkRetryStormGuard) before(ctx context.Context, auth *Auth, provider, model, stage string) error {
+func (g *networkRetryStormGuard) before(ctx context.Context, auth *Auth, provider, model, stage string) (bool, error) {
 	if g == nil {
-		return nil
+		return false, nil
 	}
 	key, proxyKind := networkRetryStormBucketKey(auth, provider)
 	now := g.currentTime()
@@ -367,21 +374,34 @@ func (g *networkRetryStormGuard) before(ctx context.Context, auth *Auth, provide
 		openUntil := bucket.openUntil
 		g.mu.Unlock()
 		logNetworkRetryStormSuppressed(ctx, provider, model, stage, proxyKind, openUntil)
-		return newNetworkRetrySuppressedError(provider)
+		return false, newNetworkRetrySuppressedError(provider)
 	}
 	if !bucket.openUntil.IsZero() {
 		if bucket.probing {
 			g.mu.Unlock()
 			logNetworkRetryStormSuppressed(ctx, provider, model, stage, proxyKind, bucket.openUntil)
-			return newNetworkRetrySuppressedError(provider)
+			return false, newNetworkRetrySuppressedError(provider)
 		}
 		bucket.probing = true
 		g.mu.Unlock()
 		logNetworkRetryStormProbe(ctx, provider, model, stage, proxyKind)
-		return nil
+		return true, nil
 	}
 	g.mu.Unlock()
-	return nil
+	return false, nil
+}
+
+func (g *networkRetryStormGuard) releaseProbe(auth *Auth, provider string) {
+	if g == nil {
+		return
+	}
+	key, _ := networkRetryStormBucketKey(auth, provider)
+	g.mu.Lock()
+	bucket := g.buckets[key]
+	if bucket != nil {
+		bucket.probing = false
+	}
+	g.mu.Unlock()
 }
 
 func (g *networkRetryStormGuard) recordFailure(ctx context.Context, auth *Auth, provider, model, stage, class string, err error) error {
@@ -2158,12 +2178,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execOpts := opts
 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		for sameAttempt := 0; ; sameAttempt++ {
-			if errStorm := m.networkRetryStormBefore(ctx, auth, provider, resultModel, "stream-open"); errStorm != nil {
+			halfOpenProbe, errStorm := m.networkRetryStormBefore(ctx, auth, provider, resultModel, "stream-open")
+			if errStorm != nil {
 				return nil, errStorm
+			}
+			releaseHalfOpenProbe := func() {
+				if halfOpenProbe {
+					m.releaseNetworkRetryStormProbe(auth, provider)
+					halfOpenProbe = false
+				}
 			}
 			streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 			if errStream != nil {
 				if errCtx := ctx.Err(); errCtx != nil {
+					releaseHalfOpenProbe()
 					return nil, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
@@ -2172,6 +2200,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					if errStream != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
+							releaseHalfOpenProbe()
 							return nil, errCtx
 						}
 					}
@@ -2189,6 +2218,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						m.MarkResult(ctx, result)
 						return nil, errStorm
 					}
+					halfOpenProbe = false
 					if sameAttempt < sameAuthNetworkRetry {
 						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-open", sameAttempt+1, sameAuthNetworkRetry, class, errStream)
 						continue
@@ -2205,8 +2235,10 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(errStream)
 				m.MarkResult(ctx, result)
 				if isRequestInvalidError(errStream) {
+					releaseHalfOpenProbe()
 					return nil, errStream
 				}
+				releaseHalfOpenProbe()
 				lastErr = errStream
 				break
 			}
@@ -2215,6 +2247,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if bootstrapErr != nil {
 				if errCtx := ctx.Err(); errCtx != nil {
 					discardStreamChunks(streamResult.Chunks)
+					releaseHalfOpenProbe()
 					return nil, errCtx
 				}
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, bootstrapErr, didRefreshOnUnauthorized); okRefresh {
@@ -2224,6 +2257,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
+							releaseHalfOpenProbe()
 							return nil, errCtx
 						}
 						bootstrapErr = retryErr
@@ -2247,6 +2281,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 						discardStreamChunks(streamResult.Chunks)
 						return nil, errStorm
 					}
+					halfOpenProbe = false
 					if sameAttempt < sameAuthNetworkRetry {
 						discardStreamChunks(streamResult.Chunks)
 						m.logSameAuthNetworkRetry(ctx, auth, provider, resultModel, "stream-bootstrap", sameAttempt+1, sameAuthNetworkRetry, class, bootstrapErr)
@@ -2265,6 +2300,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					result.RetryAfter = retryAfterFromError(bootstrapErr)
 					m.MarkResult(ctx, result)
 					discardStreamChunks(streamResult.Chunks)
+					releaseHalfOpenProbe()
 					return nil, bootstrapErr
 				}
 				rerr := &Error{Message: bootstrapErr.Error()}
@@ -2275,6 +2311,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
+				releaseHalfOpenProbe()
 				if idx < len(execModels)-1 {
 					lastErr = bootstrapErr
 					break
@@ -2969,12 +3006,20 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			for sameAttempt := 0; ; sameAttempt++ {
-				if errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "execute"); errStorm != nil {
+				halfOpenProbe, errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "execute")
+				if errStorm != nil {
 					return cliproxyexecutor.Response{}, errStorm
+				}
+				releaseHalfOpenProbe := func() {
+					if halfOpenProbe {
+						m.releaseNetworkRetryStormProbe(auth, provider)
+						halfOpenProbe = false
+					}
 				}
 				resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 				if errExec != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
+						releaseHalfOpenProbe()
 						return cliproxyexecutor.Response{}, errCtx
 					}
 					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -2983,6 +3028,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 						if errExec != nil {
 							if errCtx := execCtx.Err(); errCtx != nil {
+								releaseHalfOpenProbe()
 								return cliproxyexecutor.Response{}, errCtx
 							}
 						}
@@ -2999,6 +3045,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 							m.MarkResult(execCtx, result)
 							return cliproxyexecutor.Response{}, errStorm
 						}
+						halfOpenProbe = false
 						if sameAttempt < sameAuthNetworkRetry {
 							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "execute", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
 							continue
@@ -3016,8 +3063,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 					m.MarkResult(execCtx, result)
 					if isRequestInvalidError(errExec) {
+						releaseHalfOpenProbe()
 						return cliproxyexecutor.Response{}, errExec
 					}
+					releaseHalfOpenProbe()
 					authErr = errExec
 					break
 				}
@@ -3113,12 +3162,20 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execOpts := opts
 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 			for sameAttempt := 0; ; sameAttempt++ {
-				if errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "count"); errStorm != nil {
+				halfOpenProbe, errStorm := m.networkRetryStormBefore(execCtx, auth, provider, resultModel, "count")
+				if errStorm != nil {
 					return cliproxyexecutor.Response{}, errStorm
+				}
+				releaseHalfOpenProbe := func() {
+					if halfOpenProbe {
+						m.releaseNetworkRetryStormProbe(auth, provider)
+						halfOpenProbe = false
+					}
 				}
 				resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 				if errExec != nil {
 					if errCtx := execCtx.Err(); errCtx != nil {
+						releaseHalfOpenProbe()
 						return cliproxyexecutor.Response{}, errCtx
 					}
 					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
@@ -3127,6 +3184,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 						if errExec != nil {
 							if errCtx := execCtx.Err(); errCtx != nil {
+								releaseHalfOpenProbe()
 								return cliproxyexecutor.Response{}, errCtx
 							}
 						}
@@ -3143,6 +3201,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 							m.MarkResult(execCtx, result)
 							return cliproxyexecutor.Response{}, errStorm
 						}
+						halfOpenProbe = false
 						if sameAttempt < sameAuthNetworkRetry {
 							m.logSameAuthNetworkRetry(execCtx, auth, provider, resultModel, "count", sameAttempt+1, sameAuthNetworkRetry, class, errExec)
 							continue
@@ -3160,8 +3219,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 					m.MarkResult(execCtx, result)
 					if isRequestInvalidError(errExec) {
+						releaseHalfOpenProbe()
 						return cliproxyexecutor.Response{}, errExec
 					}
+					releaseHalfOpenProbe()
 					authErr = errExec
 					break
 				}
