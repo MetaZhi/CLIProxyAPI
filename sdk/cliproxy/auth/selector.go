@@ -23,7 +23,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
-const DefaultQuotaPriorityWindowString = "5h"
+const DefaultQuotaPriorityWindowString = "168h"
 
 var DefaultQuotaPriorityWindow = mustParseQuotaPriorityDefaultWindow()
 

@@ -28,8 +28,8 @@ func TestGetRoutingQuotaPriorityWindow_Default(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if payload["quota-priority-window"] != "5h" {
-		t.Fatalf("quota-priority-window = %q, want %q", payload["quota-priority-window"], "5h")
+	if payload["quota-priority-window"] != "168h" {
+		t.Fatalf("quota-priority-window = %q, want %q", payload["quota-priority-window"], "168h")
 	}
 }
 

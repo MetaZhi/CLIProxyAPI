@@ -340,7 +340,7 @@ type RoutingConfig struct {
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// QuotaPriorityWindow keeps the quota-priority duration setting.
-	// Default: 5h. Accepts duration strings like "2h", "5h", "8h30m".
+	// Default: 168h. Accepts duration strings like "2h", "168h", "8h30m".
 	QuotaPriorityWindow string `yaml:"quota-priority-window,omitempty" json:"quota-priority-window,omitempty"`
 
 	// MinimumQuotaPercent softly filters credentials whose known remaining quota is below this threshold.

@@ -174,8 +174,8 @@ routing:
   strategy: "round-robin" # round-robin (default), fill-first, quota-priority
   # Quota-priority ranks metadata.quota_windows by remaining quota percent per
   # reset minute, and falls back to round-robin when quota window data is missing.
-  # Default: 5h
-  quota-priority-window: "5h"
+  # Default: 168h (weekly Codex quota window)
+  quota-priority-window: "168h"
   # Soft minimum known remaining quota percent before rotating to lower-quota accounts.
   # Set to 0 to disable quota-aware filtering. Default: 0
   minimum-quota-percent: 0
