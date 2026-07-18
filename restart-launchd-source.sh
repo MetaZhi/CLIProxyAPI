@@ -58,6 +58,18 @@ if [[ ! -f "$PLIST_PATH" ]]; then
   exit 1
 fi
 
+if ! LABEL="$(plutil -extract Label raw "$PLIST_PATH")"; then
+  echo "Error: could not read Label from LaunchAgent plist: $PLIST_PATH" >&2
+  exit 1
+fi
+
+if [[ -z "$LABEL" ]]; then
+  echo "Error: LaunchAgent plist Label is empty: $PLIST_PATH" >&2
+  exit 1
+fi
+
+DOMAIN="gui/$(id -u)"
+
 cd "$REPO_ROOT"
 
 if [[ "$BUILD" -eq 1 ]]; then
@@ -67,13 +79,16 @@ if [[ "$BUILD" -eq 1 ]]; then
   go build -o "$BIN_PATH" ./cmd/server
 fi
 
-echo "Unloading $PLIST_PATH ..."
-if ! launchctl unload "$PLIST_PATH"; then
-  echo "Warning: launchctl unload failed; continuing with load." >&2
+echo "Booting out $LABEL from $DOMAIN ..."
+if ! launchctl bootout "$DOMAIN" "$PLIST_PATH"; then
+  echo "Warning: launchctl bootout failed; the job may not be loaded." >&2
 fi
 
-echo "Loading $PLIST_PATH ..."
-launchctl load "$PLIST_PATH"
+echo "Bootstrapping $PLIST_PATH into $DOMAIN ..."
+launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
+
+echo "Starting $LABEL ..."
+launchctl kickstart -k "$DOMAIN/$LABEL"
 
 if [[ "$CHECK_HEALTH" -eq 0 ]]; then
   echo "Restart requested. Health check skipped."
