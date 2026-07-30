@@ -182,6 +182,92 @@ func TestMarkResultCodexQuotaSuccessDoesNotPersist(t *testing.T) {
 	}
 }
 
+type codexQuotaHeadersTestExecutor struct {
+	schedulerTestExecutor
+	headers http.Header
+}
+
+func (e codexQuotaHeadersTestExecutor) Identifier() string {
+	return "codex"
+}
+
+func (e codexQuotaHeadersTestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Headers: e.headers.Clone()}, nil
+}
+
+func (e codexQuotaHeadersTestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{Headers: e.headers.Clone()}, nil
+}
+
+func (e codexQuotaHeadersTestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Headers: e.headers.Clone(), Chunks: chunks}, nil
+}
+
+func TestExecutionPathsPropagateCodexQuotaHeaders(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  func(*Manager) error
+	}{
+		{
+			name: "execute",
+			run: func(manager *Manager) error {
+				_, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "count tokens",
+			run: func(manager *Manager) error {
+				_, err := manager.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+				return err
+			},
+		},
+		{
+			name: "stream",
+			run: func(manager *Manager) error {
+				result, err := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Stream: true})
+				if err != nil {
+					return err
+				}
+				for range result.Chunks {
+				}
+				return nil
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := http.Header{}
+			headers.Set("X-Codex-Plan-Type", "pro")
+			headers.Set("X-Codex-Primary-Used-Percent", "10")
+			headers.Set("X-Codex-Primary-Reset-At", strconvFormatUnix(time.Now().Add(time.Hour)))
+			headers.Set("X-Codex-Primary-Window-Minutes", "300")
+
+			manager := NewManager(nil, NewQuotaPrioritySelector(5*time.Hour), nil)
+			manager.RegisterExecutor(codexQuotaHeadersTestExecutor{headers: headers})
+			if _, err := manager.Register(context.Background(), &Auth{ID: "learned", Provider: "codex", Metadata: map[string]any{"type": "codex"}}); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+			if err := tt.run(manager); err != nil {
+				t.Fatalf("execution failed: %v", err)
+			}
+
+			updated, ok := manager.GetByID("learned")
+			if !ok || updated == nil {
+				t.Fatal("updated auth not found")
+			}
+			if got, _ := updated.RuntimeMetadata["plan_type"].(string); got != "pro" {
+				t.Fatalf("runtime_metadata.plan_type = %q, want pro", got)
+			}
+			if percent, okPercent := remainingQuotaPercentAt(updated, time.Now()); !okPercent || percent != 90 {
+				t.Fatalf("remainingQuotaPercentAt() = %v, %v; want 90, true", percent, okPercent)
+			}
+		})
+	}
+}
+
 func TestUpdateCodexQuotaFromHeadersClearsProbeGuard(t *testing.T) {
 	t.Parallel()
 

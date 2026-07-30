@@ -474,6 +474,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		auth.StatusMessage = ""
 		auth.Status = StatusActive
 	}
+	clearRuntimeQuotaProbeState(auth)
 	auth.UpdatedAt = now
 	if errPersist := m.persist(ctx, auth); errPersist != nil {
 		m.mu.Unlock()
@@ -703,6 +704,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	var quotaSummary codexQuotaUpdateSummary
+	quotaUpdated := false
+	persistCodexRecovery := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -720,8 +724,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 
 		if result.Success {
+			if isCodexAuth(auth) {
+				quotaSummary, quotaUpdated = updateCodexQuotaFromHeaders(auth, result.Headers, now)
+				if len(quotaSummary.Windows) == 0 {
+					markQuotaProbeMissingHeaders(auth, now)
+				}
+			}
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
+				if isCodexAuth(auth) && !modelStateIsClean(state) {
+					persistCodexRecovery = true
+				}
 				resetModelState(state, now)
 				updateAggregatedAvailability(auth, now)
 				if !hasModelError(auth, now) {
@@ -851,7 +864,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		if !result.Success || !isCodexAuth(auth) || persistCodexRecovery {
+			_ = m.persist(ctx, auth)
+		}
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -864,6 +879,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
+	}
+	if quotaUpdated {
+		logCodexQuotaUpdate(ctx, result.AuthID, quotaSummary)
 	}
 
 	if clearModelQuota && result.Model != "" {

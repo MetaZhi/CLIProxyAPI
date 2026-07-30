@@ -353,7 +353,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 				}
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Headers: resp.Headers}
 			if errExec != nil {
 				var probeErr *networkRetryProbeError
 				if errors.As(errExec, &probeErr) {
@@ -485,7 +485,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 				}
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Headers: resp.Headers}
 			if errExec != nil {
 				var probeErr *networkRetryProbeError
 				if errors.As(errExec, &probeErr) {

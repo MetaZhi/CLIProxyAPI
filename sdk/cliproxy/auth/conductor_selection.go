@@ -330,6 +330,35 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 	return routeModel
 }
 
+func (m *Manager) syncSelectedQuotaProbeGuard(selected *Auth) *Auth {
+	if m == nil || selected == nil || selected.RuntimeMetadata == nil {
+		return selected
+	}
+	probeAfter, ok := selected.RuntimeMetadata[quotaProbeAfterMetadataKey]
+	if !ok {
+		return selected
+	}
+
+	var snapshot *Auth
+	m.mu.Lock()
+	if current := m.auths[selected.ID]; current != nil {
+		if current.RuntimeMetadata == nil {
+			current.RuntimeMetadata = make(map[string]any)
+		}
+		current.RuntimeMetadata[quotaProbeAfterMetadataKey] = probeAfter
+		snapshot = current.Clone()
+	}
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return selected
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	return snapshot
+}
+
 func schedulerAttributeSensitive(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
 	normalized := strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(key)
@@ -1015,6 +1044,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	selected = m.syncSelectedQuotaProbeGuard(selected)
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -1257,6 +1287,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	selected = m.syncSelectedQuotaProbeGuard(selected)
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
