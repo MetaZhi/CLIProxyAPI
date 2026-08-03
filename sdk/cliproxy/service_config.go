@@ -25,15 +25,19 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy           string
-	sessionAffinity    bool
-	sessionAffinityTTL time.Duration
+	strategy            string
+	minimumQuotaPercent float64
+	quotaPriorityWindow time.Duration
+	sessionAffinity     bool
+	sessionAffinityTTL  time.Duration
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:           "round-robin",
-		sessionAffinityTTL: time.Hour,
+		strategy:            "round-robin",
+		minimumQuotaPercent: coreauth.DefaultMinimumQuotaPercent,
+		quotaPriorityWindow: coreauth.DefaultQuotaPriorityWindow,
+		sessionAffinityTTL:  time.Hour,
 	}
 	if cfg == nil {
 		return state
@@ -42,9 +46,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
-	case "fill-first", "fillfirst", "ff":
-		state.strategy = "fill-first"
+	default:
+		state.strategy = normalizeRoutingStrategyValue(cfg.Routing.Strategy)
 	}
+	state.minimumQuotaPercent = routingMinimumQuotaPercent(cfg, log.Warnf)
+	state.quotaPriorityWindow = routingQuotaPriorityWindow(cfg, log.Warnf)
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
@@ -60,9 +66,14 @@ func newRoutingSelectorFromRuntimeState(state routingRuntimeState) coreauth.Sele
 	case "weighted-round-robin":
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
-		selector = &coreauth.FillFirstSelector{}
+		selector = &coreauth.FillFirstSelector{MinimumQuotaPercent: state.minimumQuotaPercent}
+	case "quota-priority":
+		selector = coreauth.NewQuotaPrioritySelector(state.quotaPriorityWindow)
+		if quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector); ok {
+			quotaSelector.MinimumQuotaPercent = state.minimumQuotaPercent
+		}
 	default:
-		selector = &coreauth.RoundRobinSelector{}
+		selector = &coreauth.RoundRobinSelector{MinimumQuotaPercent: state.minimumQuotaPercent}
 	}
 	if state.sessionAffinity {
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
