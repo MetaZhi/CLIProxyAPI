@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"math"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
 )
 
 const DefaultQuotaPriorityWindowString = "168h"
@@ -504,6 +504,14 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time, quot
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, quotaExhaustionWindow time.Duration) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, quotaExhaustionWindow, false)
+}
+
+func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time, quotaExhaustionWindow time.Duration) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, quotaExhaustionWindow, true)
+}
+
+func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, quotaExhaustionWindow time.Duration, allPriorities bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -524,24 +532,81 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time, quo
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
+	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
+
+// availableAuthsFromPriorityBuckets flattens availability buckets into a stable, ID-sorted slice.
+// When allPriorities is false only the highest available priority tier is returned.
+// When allPriorities is true every tier is merged, so the result carries no priority ordering:
+// use it for membership checks or feed it to highestPriorityAuths, never as a priority-ordered
+// selection order.
+func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allPriorities bool) []*Auth {
+	var candidates []*Auth
+	if allPriorities {
+		total := 0
+		for _, bucket := range availableByPriority {
+			total += len(bucket)
+		}
+		candidates = make([]*Auth, 0, total)
+		for _, bucket := range availableByPriority {
+			candidates = append(candidates, bucket...)
+		}
+	} else {
+		bestPriority := 0
+		found := false
+		for priority := range availableByPriority {
+			if !found || priority > bestPriority {
+				bestPriority = priority
+				found = true
+			}
+		}
+		bucket := availableByPriority[bestPriority]
+		candidates = make([]*Auth, 0, len(bucket))
+		candidates = append(candidates, bucket...)
+	}
+	if len(candidates) > 1 {
+		sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	}
+	return candidates
+}
+
+// highestPriorityAuths narrows an availability slice to its highest priority tier while
+// preserving the input order. The input slice is returned unchanged when every candidate
+// already shares the highest priority, so the common single-tier case allocates nothing.
+func highestPriorityAuths(auths []*Auth) []*Auth {
+	if len(auths) <= 1 {
+		return auths
+	}
 	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
+	bestCount := 0
+	for _, auth := range auths {
+		priority := authPriority(auth)
+		switch {
+		case bestCount == 0 || priority > bestPriority:
 			bestPriority = priority
-			found = true
+			bestCount = 1
+		case priority == bestPriority:
+			bestCount++
 		}
 	}
-
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	if bestCount == len(auths) {
+		return auths
 	}
-	return available, nil
+	highest := make([]*Auth, 0, bestCount)
+	for _, auth := range auths {
+		if authPriority(auth) == bestPriority {
+			highest = append(highest, auth)
+		}
+	}
+	return highest
 }
 
 func getSelectableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time, minimumQuotaPercent float64, quotaExhaustionWindow time.Duration) ([]*Auth, error) {
-	available, err := getAvailableAuths(auths, provider, model, now, quotaExhaustionWindow)
+	return getSelectableAuthsWithPriorityMode(ctx, auths, provider, model, now, minimumQuotaPercent, quotaExhaustionWindow, false)
+}
+
+func getSelectableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, provider, model string, now time.Time, minimumQuotaPercent float64, quotaExhaustionWindow time.Duration, allPriorities bool) ([]*Auth, error) {
+	available, err := getAvailableAuthsWithPriorityMode(auths, provider, model, now, quotaExhaustionWindow, allPriorities)
 	if err != nil {
 		return nil, err
 	}
@@ -1356,59 +1421,66 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
-			state, ok := auth.ModelStates[model]
-			if (!ok || state == nil) && model != "" {
-				baseModel := canonicalModelKey(model)
-				if baseModel != "" && baseModel != model {
-					state, ok = auth.ModelStates[baseModel]
+			modelKey := canonicalModelKey(model)
+			matched := false
+			blocked := false
+			blockedReason := blockReasonNone
+			nextRetry := time.Time{}
+			for stateModel, state := range auth.ModelStates {
+				if state == nil || canonicalModelKey(stateModel) != modelKey {
+					continue
 				}
-			}
-			if ok && state != nil {
+				matched = true
 				if state.Status == StatusDisabled {
 					return true, blockReasonDisabled, time.Time{}
 				}
-				if state.Unavailable {
-					if state.NextRetryAfter.IsZero() {
-						return false, blockReasonNone, time.Time{}
-					}
-					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
-						}
-						if next.Before(now) {
-							next = now
-						}
-						if state.Quota.Exceeded {
-							return true, blockReasonCooldown, next
-						}
-						return true, blockReasonOther, next
-					}
+				stateBlocked, reason, next := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+				if !stateBlocked {
+					continue
 				}
-				return false, blockReasonNone, time.Time{}
+				if next.IsZero() {
+					return true, reason, time.Time{}
+				}
+				if !blocked || next.After(nextRetry) || (next.Equal(nextRetry) && reason == blockReasonCooldown) {
+					blocked = true
+					blockedReason = reason
+					nextRetry = next
+				}
 			}
+			if matched {
+				return blocked, blockedReason, nextRetry
+			}
+			// Auth-level availability can aggregate failures from other models.
+			return false, blockReasonNone, time.Time{}
 		}
+		return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+	}
+	return availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now)
+}
+
+func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextRecoverAt, now time.Time) (bool, blockReason, time.Time) {
+	if !unavailable && !quotaExceeded {
 		return false, blockReasonNone, time.Time{}
 	}
-	if auth.Unavailable && auth.NextRetryAfter.After(now) {
-		next := auth.NextRetryAfter
-		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
-			next = auth.Quota.NextRecoverAt
+
+	hasRecoveryTime := !nextRetryAfter.IsZero() || !nextRecoverAt.IsZero()
+	var next time.Time
+	for _, candidate := range []time.Time{nextRetryAfter, nextRecoverAt} {
+		if candidate.After(now) && (next.IsZero() || candidate.After(next)) {
+			next = candidate
 		}
-		if next.Before(now) {
-			next = now
-		}
-		if auth.Quota.Exceeded {
+	}
+	if !next.IsZero() {
+		if quotaExceeded {
 			return true, blockReasonCooldown, next
 		}
 		return true, blockReasonOther, next
 	}
-	return false, blockReasonNone, time.Time{}
+	if hasRecoveryTime {
+		return false, blockReasonNone, time.Time{}
+	}
+	return true, blockReasonOther, time.Time{}
 }
-
-// sessionPattern matches Claude Code user_id format:
-// user_{hash}_account__session_{uuid}
-var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 
 // SessionAffinitySelector wraps another selector with session-sticky behavior.
 // It extracts session ID from multiple sources and maintains session-to-auth
@@ -1447,14 +1519,13 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 }
 
 // Pick selects an auth with session affinity when possible.
-// Priority for session ID extraction:
-//  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority
-//  2. X-Session-ID header
-//  3. Session_id header (Codex)
-//  4. X-Client-Request-Id header (PI)
-//  5. metadata.user_id (non-Claude Code format)
-//  6. conversation_id field in request body
-//  7. Stable hash from first few messages content (fallback)
+// Explicit Claude Code, Codex, OpenCode, pi, and request-body session signals
+// precede execution metadata, stable derived identity, and the legacy hash fallback.
+//
+// An established binding outranks credential priority: a bound credential that is still
+// available is reused even when a higher-priority credential recovers. Credential priority
+// applies to cold bindings, requests without a session, and genuine bound-credential
+// failover, so the fallback selector only ever receives the highest available priority tier.
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -1462,23 +1533,46 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
-		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
-	}
-
 	now := time.Now()
 	quotaWindow, _ := selectorQuotaPriorityExhaustionWindow(s.fallback)
-	available, err := getSelectableAuths(ctx, auths, provider, model, now, selectorMinimumQuotaPercent(s.fallback), quotaWindow)
+	availabilityCandidates := auths
+	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
+		availabilityCandidates = positiveWeightAuths(auths)
+	}
+	if primaryID == "" {
+		fallbackAuths, errAvailable := getSelectableAuths(ctx, availabilityCandidates, provider, model, now, selectorMinimumQuotaPercent(s.fallback), quotaWindow)
+		if errAvailable != nil {
+			return nil, errAvailable
+		}
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	}
+
+	// A single availability pass serves both lookups: the bound credential is validated against
+	// every priority tier, while the fallback selector keeps seeing only the highest tier.
+	available, err := getSelectableAuthsWithPriorityMode(ctx, availabilityCandidates, provider, model, now, selectorMinimumQuotaPercent(s.fallback), quotaWindow, true)
 	if err != nil {
 		return nil, err
 	}
+	fallbackAuths := highestPriorityAuths(available)
 
 	cacheKey := provider + "::" + primaryID + "::" + model
+	fallbackKey := ""
+	if fallbackID != "" && fallbackID != primaryID {
+		fallbackKey = provider + "::" + fallbackID + "::" + model
+	}
+	bind := func(authID string) {
+		if fallbackKey != "" {
+			s.cache.SetAliases(authID, cacheKey, fallbackKey)
+			return
+		}
+		s.cache.Set(cacheKey, authID)
+	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
 			}
@@ -1488,7 +1582,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				truncateSessionID(primaryID), cachedAuthID, provider, model, len(available), selectorMinimumQuotaPercent(s.fallback), formatAuthSelectionCandidates(available, now, quotaWindow))
 		}
 		// Cached auth not selectable, reselect via fallback selector for even distribution.
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
@@ -1496,17 +1590,16 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: skipped cache for quota warmup | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
-		s.cache.Set(cacheKey, auth.ID)
+		bind(auth.ID)
 		entry.Infof("session-affinity: cache hit but auth not selectable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
 
-	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey := provider + "::" + fallbackID + "::" + model
+	if fallbackKey != "" {
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+					bind(auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -1514,7 +1607,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
@@ -1522,7 +1615,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		entry.Infof("session-affinity: skipped cache for quota warmup | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
-	s.cache.Set(cacheKey, auth.ID)
+	bind(auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
 }
@@ -1560,83 +1653,108 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 	}
 }
 
-// ExtractSessionID extracts session identifier from multiple sources.
-// Priority order:
-//  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
-//  2. X-Session-ID header
-//  3. Session_id header (Codex)
-//  4. X-Client-Request-Id header (PI)
-//  5. metadata.user_id (non-Claude Code format)
-//  6. conversation_id field in request body
-//  7. Stable hash from first few messages content (fallback)
+// normalizedSessionCandidate validates an explicit client-provided session signal.
+// It keeps opaque printable IDs intact while rejecting values that are unsafe or
+// implausibly large for routing keys and logs.
+func normalizedSessionCandidate(raw string) string {
+	return cliproxysession.NormalizeExplicitID(raw)
+}
+
+func sessionHeaderValue(headers http.Header, name string) string {
+	if headers == nil {
+		return ""
+	}
+	if value := normalizedSessionCandidate(headers.Get(name)); value != "" {
+		return value
+	}
+	for key, values := range headers {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		for _, raw := range values {
+			if value := normalizedSessionCandidate(raw); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+// ExtractSessionID extracts a session identifier from explicit client signals,
+// then falls back to execution metadata, derived identity, and message history.
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
 }
 
 // extractSessionIDs returns (primaryID, fallbackID) for session affinity.
-// primaryID: full hash including assistant response (stable after first turn)
-// fallbackID: short hash without assistant (used to inherit binding from first turn)
+// fallbackID preserves an earlier binding when a stronger body identifier appears
+// later, and lets callers bind both identifiers when both are present.
 func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]any) (string, string) {
-	// 1. metadata.user_id with Claude Code session format (highest priority)
+	if sid := sessionHeaderValue(headers, "X-Claude-Code-Session-Id"); sid != "" {
+		return "claude:" + sid, ""
+	}
+	if sid := cliproxysession.ClaudeMetadataSessionID(payload); sid != "" {
+		return "claude:" + sid, ""
+	}
+	if sid := sessionHeaderValue(headers, "Session-Id"); sid != "" {
+		return "codex:" + sid, ""
+	}
+	if sid := sessionHeaderValue(headers, "Session_id"); sid != "" {
+		return "codex:" + sid, ""
+	}
+	if sid := sessionHeaderValue(headers, "X-Session-ID"); sid != "" {
+		return "header:" + sid, ""
+	}
+	if sid := sessionHeaderValue(headers, "X-Session-Affinity"); sid != "" {
+		return "affinity:" + sid, ""
+	}
+	if sid := sessionHeaderValue(headers, "X-Client-Request-Id"); sid != "" {
+		return "clientreq:" + sid, ""
+	}
+
 	if len(payload) > 0 {
-		userID := gjson.GetBytes(payload, "metadata.user_id").String()
-		if userID != "" {
-			// Old format: user_{hash}_account__session_{uuid}
-			if matches := sessionPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-				id := "claude:" + matches[1]
-				return id, ""
-			}
-			// New format: JSON object with session_id field
-			// e.g. {"device_id":"...","account_uuid":"...","session_id":"uuid"}
-			if len(userID) > 0 && userID[0] == '{' {
-				if sid := gjson.Get(userID, "session_id").String(); sid != "" {
-					return "claude:" + sid, ""
-				}
+		for _, path := range []string{"session_id", "sessionId"} {
+			if sid := normalizedSessionCandidate(gjson.GetBytes(payload, path).String()); sid != "" {
+				return "session:" + sid, ""
 			}
 		}
-	}
 
-	// 2. X-Session-ID header
-	if headers != nil {
-		if sid := headers.Get("X-Session-ID"); sid != "" {
-			return "header:" + sid, ""
+		conversationID := ""
+		conversation := gjson.GetBytes(payload, "conversation")
+		if sid := normalizedSessionCandidate(conversation.Get("id").String()); sid != "" {
+			conversationID = "conv:" + sid
+		} else if conversation.Type == gjson.String {
+			if sid := normalizedSessionCandidate(conversation.String()); sid != "" {
+				conversationID = "conv:" + sid
+			}
+		}
+		if sid := normalizedSessionCandidate(gjson.GetBytes(payload, "prompt_cache_key").String()); sid != "" {
+			return "pck:" + sid, conversationID
+		}
+		if conversationID != "" {
+			return conversationID, ""
+		}
+
+		if userID := normalizedSessionCandidate(gjson.GetBytes(payload, "metadata.user_id").String()); userID != "" {
+			return "user:" + userID, ""
+		}
+		if conversationID := normalizedSessionCandidate(gjson.GetBytes(payload, "conversation_id").String()); conversationID != "" {
+			return "conv:" + conversationID, ""
 		}
 	}
 
-	// 3. Session_id header (Codex)
-	if headers != nil {
-		if sid := headers.Get("Session-Id"); sid != "" {
-			return "codex:" + sid, ""
-		}
-		if sid := headers.Get("Session_id"); sid != "" {
-			return "codex:" + sid, ""
+	if executionID, ok := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok {
+		if executionID = normalizedSessionCandidate(executionID); executionID != "" {
+			return "execution:" + executionID, ""
 		}
 	}
-
-	// 4. X-Client-Request-Id header (PI)
-	if headers != nil {
-		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
-			return "clientreq:" + rid, ""
-		}
+	if derivedID := normalizedSessionCandidate(cliproxysession.DerivedID(metadata)); derivedID != "" {
+		return "derived:" + derivedID, ""
 	}
-
 	if len(payload) == 0 {
 		return "", ""
 	}
-
-	// 6. metadata.user_id (non-Claude Code format)
-	userID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if userID != "" {
-		return "user:" + userID, ""
-	}
-
-	// 7. conversation_id field
-	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
-		return "conv:" + convID, ""
-	}
-
-	// 8. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 

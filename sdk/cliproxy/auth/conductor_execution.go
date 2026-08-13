@@ -20,6 +20,19 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+func claudeOAuthRequestCancellation(ctx context.Context, auth *Auth, err error) error {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") || !strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "oauth") {
+		return nil
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -310,6 +323,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+				return cliproxyexecutor.Response{}, errCancel
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -352,6 +368,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						}
 					}
 				}
+			}
+			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Headers: resp.Headers}
 			if errExec != nil {
@@ -442,6 +461,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+				return cliproxyexecutor.Response{}, errCancel
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			m.MarkResult(execCtx, result)
 			lastErr = errPrepare
@@ -484,6 +506,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						}
 					}
 				}
+			}
+			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errExec); errCancel != nil {
+				return cliproxyexecutor.Response{}, errCancel
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, Headers: resp.Headers}
 			if errExec != nil {
@@ -543,6 +568,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	unauthorizedRefreshTried := make(map[string]struct{})
 	var lastErr error
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -583,6 +609,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 		}
+		if selection != nil {
+			if _, refreshedAlready := unauthorizedRefreshTried[auth.ID]; refreshedAlready {
+				selection.End("repeated_refresh_auth")
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, repeatedHomeAuthError()
+			}
+		}
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
@@ -609,6 +644,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		// Enrich before auth preparation so prepare-stage usage records observe the client request.
+		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		models, pooled, aliasResult, routing := m.preparedExecutionModelsWithAlias(auth, routeModel)
 		if selection != nil && aliasResult.ForceMapping && responseAlias != "" {
 			aliasResult.OriginalAlias = responseAlias
@@ -630,6 +667,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
+			if selection == nil {
+				if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
+					return nil, errCancel
+				}
+			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: resultErrorFromError(errPrepare)}
 			if selection != nil {
 				m.reportHomeResult(execCtx, result, auth)
@@ -658,7 +700,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode, selection != nil)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil, unauthorizedRefreshTried)
 		if errStream != nil {
 			if selection != nil {
 				releaseAttempt()
@@ -801,12 +843,15 @@ type requestAuthPrepareLock struct {
 
 // prepareHomeRequestAuth prepares a dispatch auth without reading or updating local auth state.
 func (m *Manager) prepareHomeRequestAuth(ctx context.Context, executor ProviderExecutor, selection *HomeDispatchSelection) (*Auth, error) {
-	if m == nil || executor == nil || selection == nil {
+	if selection == nil {
 		return nil, nil
 	}
-	auth := selection.CloneAuth()
-	if auth == nil {
-		return nil, nil
+	return m.prepareHomeAuthSnapshot(ctx, executor, selection.CloneAuth())
+}
+
+func (m *Manager) prepareHomeAuthSnapshot(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
+	if m == nil || executor == nil || auth == nil {
+		return auth, nil
 	}
 	preparer, ok := executor.(RequestAuthPreparer)
 	if !ok || preparer == nil || !preparer.ShouldPrepareRequestAuth(auth) {

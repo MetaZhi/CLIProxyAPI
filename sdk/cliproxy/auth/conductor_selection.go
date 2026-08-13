@@ -42,7 +42,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *QuotaPrioritySelector:
 		return true
 	default:
 		return false
@@ -287,6 +287,14 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 }
 
 func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, false)
+}
+
+func (m *Manager) availableAuthsForRouteModelAcrossPriorities(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	return m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, true)
+}
+
+func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, provider, routeModel string, now time.Time, allPriorities bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -325,20 +333,32 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
+	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
+
+// availableAuthsForSelector reports the candidates handed to priority-scoped consumers such as
+// the plugin scheduler, plus the candidates handed to the configured selector. Both are equal
+// unless session affinity is active, in which case the selector additionally receives lower
+// priority tiers so an established binding can be validated instead of being preempted by a
+// recovered higher-priority credential.
+func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
+	if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
+		if err != nil {
+			return nil, nil, err
 		}
+		priorityAuths = cloneAuthSlice(priorityAuths)
+		return priorityAuths, priorityAuths, nil
 	}
 
-	available := availableByPriority[bestPriority]
-	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	// One availability pass and one clone pass serve both lists: the highest priority tier is a
+	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
+	selectorAuths, err = m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
+	if err != nil {
+		return nil, nil, err
 	}
-	return available, nil
+	selectorAuths = cloneAuthSlice(selectorAuths)
+	return highestPriorityAuths(selectorAuths), selectorAuths, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -375,6 +395,17 @@ func (m *Manager) syncSelectedQuotaProbeGuard(selected *Auth) *Auth {
 		m.scheduler.upsertAuth(snapshot)
 	}
 	return snapshot
+}
+
+func restoreModelCooldownErrorModel(err error, requestedModel string) error {
+	if err == nil || requestedModel == "" {
+		return err
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) || cooldownErr == nil || cooldownErr.model != "" {
+		return err
+	}
+	return newModelCooldownError(requestedModel, cooldownErr.provider, cooldownErr.resetIn)
 }
 
 func schedulerAttributeSensitive(key string) bool {
@@ -452,13 +483,17 @@ func schedulerAuthCandidates(auths []*Auth) []pluginapi.SchedulerAuthCandidate {
 		if auth == nil {
 			continue
 		}
-		out = append(out, pluginapi.SchedulerAuthCandidate{
+		candidate := pluginapi.SchedulerAuthCandidate{
 			ID:         auth.ID,
 			Provider:   strings.ToLower(strings.TrimSpace(auth.Provider)),
 			Priority:   authPriority(auth),
 			Status:     string(auth.Status),
 			Attributes: schedulerSafeAttributes(auth.Attributes),
-		})
+		}
+		if remaining, ok := remainingQuotaPercent(auth); ok {
+			candidate.RemainingQuotaPercent = &remaining
+		}
+		out = append(out, candidate)
 	}
 	return out
 }
@@ -510,6 +545,8 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 		return schedulerStrategyRoundRobin, true
 	case pluginapi.SchedulerBuiltinFillFirst:
 		return schedulerStrategyFillFirst, true
+	case pluginapi.SchedulerBuiltinQuotaPriority:
+		return schedulerStrategyQuota, true
 	default:
 		return schedulerStrategyCustom, false
 	}
@@ -1040,12 +1077,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, provider, []string{provider}, model, opts, tried, available)
@@ -1054,8 +1090,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if !handled {
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(selectorCtx, provider, selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
+			if isBuiltInSelector(selector) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			return nil, nil, errPick
 		}
 	}
@@ -1210,14 +1249,15 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 			return nil, errSelection
 		}
 		providerMatches := strings.TrimSpace(provider) == "" || strings.EqualFold(strings.TrimSpace(selection.Provider), strings.TrimSpace(provider))
-		kindMatches := selection.Auth != nil && selection.Auth.AuthKind() == requiredKind
+		selectionAuth := selection.CloneAuth()
+		kindMatches := selectionAuth != nil && selectionAuth.AuthKind() == requiredKind
 		if providerMatches && kindMatches {
 			return selection, nil
 		}
 
 		authID := ""
-		if selection.Auth != nil {
-			authID = strings.TrimSpace(selection.Auth.ID)
+		if selectionAuth != nil {
+			authID = strings.TrimSpace(selectionAuth.ID)
 		}
 		reason := "auth_kind_mismatch"
 		if !providerMatches {
@@ -1358,12 +1398,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, time.Now())
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	available = cloneAuthSlice(available)
 	m.mu.RUnlock()
 
 	selected, handled, errPick := m.pickViaPluginScheduler(ctx, pluginScheduler, "mixed", providers, model, opts, tried, available)
@@ -1372,8 +1411,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if !handled {
 		selectorCtx := withWeightedSelectorStateModel(ctx, selector, model)
-		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, available)
+		selected, errPick = selector.Pick(selectorCtx, "mixed", selectionArgForSelector(selector, model), opts, selectorAuths)
 		if errPick != nil {
+			if isBuiltInSelector(selector) {
+				errPick = restoreModelCooldownErrorModel(errPick, model)
+			}
 			return nil, nil, "", errPick
 		}
 	}

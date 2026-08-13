@@ -75,10 +75,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 	now := time.Now()
-	clearedCooldown := false
+	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -94,7 +95,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
-	if clearedCooldown {
+	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
 	return auth.Clone(), nil
@@ -108,6 +109,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
+	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
@@ -127,9 +129,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	now := time.Now()
-	clearedCooldown := false
+	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
-		clearedCooldown = clearCooldownStateForAuth(auth, now)
+		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -144,7 +146,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	if clearedCooldown {
+	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
 	}
 	return auth.Clone(), nil
@@ -232,6 +234,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
+		ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
