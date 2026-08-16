@@ -611,7 +611,7 @@ func getSelectableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, prov
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = filterAuthsByMinimumQuota(available, minimumQuotaPercent)
+	available = filterAuthsByMinimumQuota(available, minimumQuotaPercent, now, quotaExhaustionWindow)
 	entry := selectorLogEntry(ctx)
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		logWindow := quotaExhaustionWindow
@@ -653,6 +653,7 @@ type quotaWindowScore struct {
 	RemainingPercent float64
 	ResetAt          time.Time
 	ResetIn          time.Duration
+	Window           time.Duration
 	Score            float64
 	Multiplier       float64
 }
@@ -815,7 +816,8 @@ func bestQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) (quot
 		if !okMap {
 			continue
 		}
-		if !quotaWindowMatchesDuration(name, windowMeta, window) {
+		windowDuration, okDuration := quotaWindowDuration(name, windowMeta)
+		if !okDuration || windowDuration != normalizeQuotaPriorityWindow(window) {
 			continue
 		}
 		resetAt, okReset := quotaWindowResetAtFromMap(windowMeta)
@@ -837,6 +839,7 @@ func bestQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) (quot
 			RemainingPercent: percent,
 			ResetAt:          resetAt,
 			ResetIn:          resetIn,
+			Window:           windowDuration,
 			Score:            score,
 			Multiplier:       multiplier,
 		}
@@ -853,18 +856,20 @@ func quotaWindowMatchesDuration(name string, meta map[string]any, window time.Du
 	if window <= 0 {
 		return false
 	}
+	duration, ok := quotaWindowDuration(name, meta)
+	return ok && duration == window
+}
+
+func quotaWindowDuration(name string, meta map[string]any) (time.Duration, bool) {
 	for _, key := range []string{"window_minutes", "windowMinutes"} {
 		if value, ok := meta[key]; ok {
 			minutes, okParse := parseQuotaFloat(value)
 			if okParse && minutes > 0 {
-				return time.Duration(minutes*float64(time.Minute)) == window
+				return time.Duration(minutes * float64(time.Minute)), true
 			}
 		}
 	}
-	if parsed, ok := quotaWindowDurationFromName(name); ok {
-		return parsed == window
-	}
-	return false
+	return quotaWindowDurationFromName(name)
 }
 
 func quotaWindowDurationFromName(name string) (time.Duration, bool) {
@@ -998,11 +1003,14 @@ func finiteQuotaFloat(value float64) (float64, bool) {
 }
 
 func minimumQuotaAllowedAuthIDs(auths []*Auth, threshold float64) map[string]struct{} {
+	return minimumQuotaAllowedAuthIDsAt(auths, threshold, time.Now(), 0)
+}
+
+func minimumQuotaAllowedAuthIDsAt(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) map[string]struct{} {
 	threshold = normalizeMinimumQuotaPercent(threshold)
 	if threshold <= 0 || len(auths) == 0 {
 		return nil
 	}
-	now := time.Now()
 	eligible := make(map[string]struct{})
 	unknown := make(map[string]struct{})
 	low := make(map[string]float64)
@@ -1011,12 +1019,12 @@ func minimumQuotaAllowedAuthIDs(auths []*Auth, threshold float64) map[string]str
 		if auth == nil {
 			continue
 		}
-		percent, ok := remainingQuotaPercentAt(auth, now)
+		percent, effectiveThreshold, ok := minimumQuotaForAuth(auth, now, threshold, quotaWindow)
 		if !ok {
 			unknown[auth.ID] = struct{}{}
 			continue
 		}
-		if percent >= threshold {
+		if percent >= effectiveThreshold {
 			eligible[auth.ID] = struct{}{}
 			continue
 		}
@@ -1049,8 +1057,30 @@ func minimumQuotaAllowedAuthIDs(auths []*Auth, threshold float64) map[string]str
 	return allowed
 }
 
-func filterAuthsByMinimumQuota(auths []*Auth, threshold float64) []*Auth {
-	allowed := minimumQuotaAllowedAuthIDs(auths, threshold)
+func minimumQuotaForAuth(auth *Auth, now time.Time, threshold float64, quotaWindow time.Duration) (remainingPercent, effectiveThreshold float64, ok bool) {
+	if quotaWindow > 0 {
+		if score, okScore := bestQuotaWindowScore(auth, now, quotaWindow); okScore && score.Window > 0 {
+			return score.RemainingPercent, scaleMinimumQuotaPercent(threshold, score.ResetIn, score.Window), true
+		}
+	}
+
+	percent, okPercent := remainingQuotaPercentAt(auth, now)
+	return percent, threshold, okPercent
+}
+
+func scaleMinimumQuotaPercent(threshold float64, resetIn, window time.Duration) float64 {
+	threshold = normalizeMinimumQuotaPercent(threshold)
+	if threshold <= 0 || resetIn <= 0 {
+		return 0
+	}
+	if window <= 0 || resetIn >= window {
+		return threshold
+	}
+	return threshold * float64(resetIn) / float64(window)
+}
+
+func filterAuthsByMinimumQuota(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) []*Auth {
+	allowed := minimumQuotaAllowedAuthIDsAt(auths, threshold, now, quotaWindow)
 	if allowed == nil {
 		return auths
 	}

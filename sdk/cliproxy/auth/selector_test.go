@@ -537,6 +537,73 @@ func TestRoundRobinSelectorPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T)
 	}
 }
 
+func TestMinimumQuotaAllowedAuthIDsAt_ScalesThresholdWithQuotaWindowTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	auths := []*Auth{
+		{ID: "full-window-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 168 * time.Hour},
+		})},
+		{ID: "half-window-eligible", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 84 * time.Hour},
+		})},
+		{ID: "half-window-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 9, resetIn: 84 * time.Hour},
+		})},
+	}
+
+	allowed := minimumQuotaAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
+	if len(allowed) != 1 {
+		t.Fatalf("allowed auth count = %d, want 1", len(allowed))
+	}
+	if _, ok := allowed["half-window-eligible"]; !ok {
+		t.Fatalf("half-window-eligible was not selected")
+	}
+}
+
+func TestQuotaPrioritySelectorPick_ScalesMinimumQuotaWithWindowTime(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(168 * time.Hour)
+	selector.MinimumQuotaPercent = 20
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		{ID: "full-window-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 168 * time.Hour},
+		})},
+		{ID: "half-window-eligible", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 84 * time.Hour},
+		})},
+	}
+
+	got, errPick := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if got == nil || got.ID != "half-window-eligible" {
+		t.Fatalf("Pick() auth = %v, want half-window-eligible", got)
+	}
+}
+
+func TestMinimumQuotaAllowedAuthIDsAt_UsesFixedThresholdWithoutTargetResetTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	auths := []*Auth{
+		{ID: "low", Metadata: map[string]any{"remaining_percent": 10}},
+		{ID: "eligible", Metadata: map[string]any{"remaining_percent": 20}},
+	}
+
+	allowed := minimumQuotaAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
+	if len(allowed) != 1 {
+		t.Fatalf("allowed auth count = %d, want 1", len(allowed))
+	}
+	if _, ok := allowed["eligible"]; !ok {
+		t.Fatalf("eligible was not selected")
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 

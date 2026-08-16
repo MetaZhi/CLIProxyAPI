@@ -209,6 +209,9 @@ routing:
   # Default: 168h (weekly Codex quota window)
   quota-priority-window: "168h"
   # Soft minimum known remaining quota percent before rotating to lower-quota accounts.
+  # With quota-priority and matching reset data, this threshold scales linearly with
+  # the remaining quota window: at half of the window, a 20% threshold becomes 10%.
+  # When reset data is unavailable, the configured threshold is used unchanged.
   # Set to 0 to disable quota-aware filtering. Default: 0
   minimum-quota-percent: 0
   # Enable universal session-sticky routing for all clients.
