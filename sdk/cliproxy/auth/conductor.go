@@ -56,8 +56,12 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Headers carries upstream response headers observed for this result.
 	Headers http.Header
+	// CredentialScope indicates that the failure affects the whole credential across models (e.g. Anthropic 5h/7d unified limits).
+	CredentialScope bool
 	// Error describes the failure when Success is false.
 	Error *Error
+	// Options carries execution request options (headers, metadata, etc.) for result tracking.
+	Options cliproxyexecutor.Options
 }
 
 // Selector chooses an auth candidate for execution.

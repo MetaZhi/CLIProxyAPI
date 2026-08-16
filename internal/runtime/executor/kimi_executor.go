@@ -50,6 +50,14 @@ func NewKimiExecutor(cfg *config.Config) *KimiExecutor {
 // Identifier returns the executor identifier.
 func (e *KimiExecutor) Identifier() string { return "kimi" }
 
+// RequestToFormat reports the upstream request format used after auth selection.
+func (e *KimiExecutor) RequestToFormat(_ cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
+	if opts.SourceFormat == sdktranslator.FormatClaude {
+		return sdktranslator.FormatClaude
+	}
+	return sdktranslator.FormatOpenAI
+}
+
 // PrepareRequest injects Kimi credentials into the outgoing HTTP request.
 func (e *KimiExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -198,6 +206,9 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// Note: TranslateNonStream uses req.Model (original with suffix) to preserve
 	// the original model name in the response for client compatibility.
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, data, &param)
+	if responseFormat == sdktranslator.FormatOpenAIResponse {
+		out = helps.EnsureResponsesUsageDetails(out)
+	}
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
