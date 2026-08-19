@@ -115,13 +115,13 @@ func TestPutRoutingQuotaPriorityWindow_PersistsValue(t *testing.T) {
 	}
 }
 
-func TestGetRoutingMinimumQuotaPercent_Default(t *testing.T) {
+func TestGetRoutingQuotaReservePercent_Default(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 
 	handler := &Handler{cfg: &config.Config{}}
-	handler.GetRoutingMinimumQuotaPercent(ctx)
+	handler.GetRoutingQuotaReservePercent(ctx)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -130,12 +130,12 @@ func TestGetRoutingMinimumQuotaPercent_Default(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if payload["minimum-quota-percent"] != 0 {
-		t.Fatalf("minimum-quota-percent = %v, want 0", payload["minimum-quota-percent"])
+	if payload["quota-reserve-percent"] != 0 {
+		t.Fatalf("quota-reserve-percent = %v, want 0", payload["quota-reserve-percent"])
 	}
 }
 
-func TestPutRoutingMinimumQuotaPercent_AcceptsRange(t *testing.T) {
+func TestPutRoutingQuotaReservePercent_AcceptsRange(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	for _, value := range []string{"0", "20", "100"} {
@@ -148,33 +148,33 @@ func TestPutRoutingMinimumQuotaPercent_AcceptsRange(t *testing.T) {
 
 			rec := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(rec)
-			ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/minimum-quota-percent", bytes.NewBufferString(`{"value":`+value+`}`))
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/quota-reserve-percent", bytes.NewBufferString(`{"value":`+value+`}`))
 			ctx.Request.Header.Set("Content-Type", "application/json")
 
 			handler := &Handler{
 				cfg:            &config.Config{},
 				configFilePath: configPath,
 			}
-			handler.PutRoutingMinimumQuotaPercent(ctx)
+			handler.PutRoutingQuotaReservePercent(ctx)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 			}
-			if handler.cfg.Routing.MinimumQuotaPercent == nil {
-				t.Fatalf("handler.cfg.Routing.MinimumQuotaPercent = nil, want %s", value)
+			if handler.cfg.Routing.QuotaReservePercent == nil {
+				t.Fatalf("handler.cfg.Routing.QuotaReservePercent = nil, want %s", value)
 			}
 			var want float64
 			if err := json.Unmarshal([]byte(value), &want); err != nil {
 				t.Fatalf("json.Unmarshal(value) error = %v", err)
 			}
-			if *handler.cfg.Routing.MinimumQuotaPercent != want {
-				t.Fatalf("handler.cfg.Routing.MinimumQuotaPercent = %v, want %v", *handler.cfg.Routing.MinimumQuotaPercent, want)
+			if *handler.cfg.Routing.QuotaReservePercent != want {
+				t.Fatalf("handler.cfg.Routing.QuotaReservePercent = %v, want %v", *handler.cfg.Routing.QuotaReservePercent, want)
 			}
 		})
 	}
 }
 
-func TestPutRoutingMinimumQuotaPercent_RejectsInvalidValues(t *testing.T) {
+func TestPutRoutingQuotaReservePercent_RejectsInvalidValues(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	for _, body := range []string{
@@ -186,11 +186,11 @@ func TestPutRoutingMinimumQuotaPercent_RejectsInvalidValues(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(rec)
-			ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/minimum-quota-percent", bytes.NewBufferString(body))
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/routing/quota-reserve-percent", bytes.NewBufferString(body))
 			ctx.Request.Header.Set("Content-Type", "application/json")
 
 			handler := &Handler{cfg: &config.Config{}}
-			handler.PutRoutingMinimumQuotaPercent(ctx)
+			handler.PutRoutingQuotaReservePercent(ctx)
 
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)

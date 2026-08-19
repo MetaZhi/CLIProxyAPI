@@ -555,11 +555,11 @@ func TestSchedulerPick_QuotaPriorityPrefersWebsocketSubset(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_RoundRobinAppliesMinimumQuota(t *testing.T) {
+func TestSchedulerPick_RoundRobinAppliesQuotaReserve(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&RoundRobinSelector{QuotaReservePercent: 20},
 		&Auth{ID: "a-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 10}},
 		&Auth{ID: "b-unknown", Provider: "gemini"},
 		&Auth{ID: "c-good", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 80}},
@@ -580,11 +580,11 @@ func TestSchedulerPick_RoundRobinAppliesMinimumQuota(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T) {
+func TestSchedulerPick_QuotaReserveAllLowUsesHighestQuota(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&RoundRobinSelector{QuotaReservePercent: 20},
 		&Auth{ID: "a-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 10}},
 		&Auth{ID: "b-highest-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 15}},
 		&Auth{ID: "c-lower", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 5}},
@@ -604,11 +604,11 @@ func TestSchedulerPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_MinimumQuotaRespectsPriorityBuckets(t *testing.T) {
+func TestSchedulerPick_QuotaReserveRespectsPriorityBuckets(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&RoundRobinSelector{QuotaReservePercent: 20},
 		&Auth{ID: "high-low-quota", Provider: "gemini", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{"remaining_percent": 5}},
 		&Auth{ID: "low-good-quota", Provider: "gemini", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{"remaining_percent": 95}},
 	)
@@ -625,7 +625,7 @@ func TestSchedulerPick_MinimumQuotaRespectsPriorityBuckets(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_PerAuthMinimumQuotaSkipsBlockedHighPriority(t *testing.T) {
+func TestSchedulerPick_PerAuthQuotaReserveSkipsBlockedHighPriority(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC().Truncate(time.Second)
@@ -644,11 +644,11 @@ func TestSchedulerPick_PerAuthMinimumQuotaSkipsBlockedHighPriority(t *testing.T)
 
 			scheduler := newSchedulerForTest(
 				tt.selector,
-				withMinimumQuotaThresholds(&Auth{ID: "high-low-5h", Provider: "codex", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
-					"5h": {remainingPercent: 5, resetIn: 5 * time.Hour},
-				})}, map[string]float64{"5h": 10}),
+				withQuotaReserveThresholds(&Auth{ID: "high-low-week", Provider: "codex", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+					"week": {remainingPercent: 5, resetIn: 7 * 24 * time.Hour},
+				})}, map[string]float64{"week": 10}),
 				&Auth{ID: "low-eligible", Provider: "codex", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
-					"5h": {remainingPercent: 50, resetIn: 5 * time.Hour},
+					"week": {remainingPercent: 50, resetIn: 7 * 24 * time.Hour},
 				})},
 			)
 
@@ -666,15 +666,15 @@ func TestSchedulerPick_PerAuthMinimumQuotaSkipsBlockedHighPriority(t *testing.T)
 	}
 }
 
-func TestSchedulerPick_PerAuthMinimumQuotaAllBlockedReturnsCooldown(t *testing.T) {
+func TestSchedulerPick_PerAuthQuotaReserveAllBlockedReturnsCooldown(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC().Truncate(time.Second)
 	scheduler := newSchedulerForTest(
 		&RoundRobinSelector{},
-		withMinimumQuotaThresholds(&Auth{ID: "only-low-5h", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
-			"5h": {remainingPercent: 5, resetIn: 5 * time.Hour},
-		})}, map[string]float64{"5h": 10}),
+		withQuotaReserveThresholds(&Auth{ID: "only-low-week", Provider: "codex", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 5, resetIn: 7 * 24 * time.Hour},
+		})}, map[string]float64{"week": 10}),
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
@@ -688,17 +688,40 @@ func TestSchedulerPick_PerAuthMinimumQuotaAllBlockedReturnsCooldown(t *testing.T
 	if cooldownErr.provider != "codex" {
 		t.Fatalf("cooldown provider = %q, want codex", cooldownErr.provider)
 	}
-	if cooldownErr.resetIn <= 0 || cooldownErr.resetIn > 5*time.Hour {
-		t.Fatalf("cooldown resetIn = %s, want within 5h", cooldownErr.resetIn)
+	if cooldownErr.resetIn <= 0 || cooldownErr.resetIn > 7*24*time.Hour {
+		t.Fatalf("cooldown resetIn = %s, want within one week", cooldownErr.resetIn)
 	}
 }
 
-func TestSchedulerPick_QuotaPriorityAppliesMinimumQuotaBeforeQuota(t *testing.T) {
+func TestSchedulerPick_QuotaPriorityPrefersPerAccountWeeklyHeadroom(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	scheduler := newSchedulerForTest(
+		NewQuotaPrioritySelector(7*24*time.Hour),
+		withQuotaReserveThresholds(&Auth{ID: "pro-at-reserve", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 84 * time.Hour},
+		})}, map[string]float64{"week": 100}),
+		withQuotaReserveThresholds(&Auth{ID: "plus-with-headroom", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 51, resetIn: 84 * time.Hour},
+		})}, map[string]float64{"week": 100}),
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "plus-with-headroom" {
+		t.Fatalf("pickSingle() auth = %v, want plus-with-headroom", got)
+	}
+}
+
+func TestSchedulerPick_QuotaPriorityAppliesQuotaReserveBeforeQuota(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	selector := NewQuotaPrioritySelector(5 * time.Hour)
-	selector.MinimumQuotaPercent = 20
+	selector.QuotaReservePercent = 20
 	scheduler := newSchedulerForTest(
 		selector,
 		&Auth{ID: "soon-low", Provider: "gemini", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
@@ -750,11 +773,11 @@ func TestSchedulerPick_QuotaPriorityAppliesCodexPlanCapacityMultiplier(t *testin
 	}
 }
 
-func TestSchedulerPick_WebsocketSubsetAppliesMinimumQuota(t *testing.T) {
+func TestSchedulerPick_WebsocketSubsetAppliesQuotaReserve(t *testing.T) {
 	t.Parallel()
 
 	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{MinimumQuotaPercent: 20},
+		&RoundRobinSelector{QuotaReservePercent: 20},
 		&Auth{ID: "codex-http-good", Provider: "codex", Metadata: map[string]any{"remaining_percent": 90}},
 		&Auth{ID: "codex-ws-lower", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"remaining_percent": 10}},
 		&Auth{ID: "codex-ws-highest-low", Provider: "codex", Attributes: map[string]string{"websockets": "true"}, Metadata: map[string]any{"remaining_percent": 15}},
@@ -1710,10 +1733,10 @@ func TestManagerPluginSchedulerDelegatesBuiltin(t *testing.T) {
 		}
 	})
 
-	t.Run("round-robin with minimum quota", func(t *testing.T) {
-		minimumQuota := 20.0
+	t.Run("round-robin with quota reserve", func(t *testing.T) {
+		quotaReserve := 20.0
 		manager := NewManager(nil, &FillFirstSelector{}, nil)
-		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{MinimumQuotaPercent: &minimumQuota}})
+		manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{QuotaReservePercent: &quotaReserve}})
 		manager.executors["gemini"] = schedulerTestExecutor{}
 		if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-low", Provider: "gemini", Metadata: map[string]any{"remaining_percent": 5}}); errRegister != nil {
 			t.Fatalf("Register(auth-low) error = %v", errRegister)

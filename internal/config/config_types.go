@@ -219,9 +219,9 @@ type RoutingConfig struct {
 	// Default: 168h. Accepts duration strings like "2h", "168h", "8h30m".
 	QuotaPriorityWindow string `yaml:"quota-priority-window,omitempty" json:"quota-priority-window,omitempty"`
 
-	// MinimumQuotaPercent softly filters credentials whose known remaining quota is below this threshold.
+	// QuotaReservePercent softly filters credentials whose known remaining quota is below this threshold.
 	// Default: 0 (disabled). When all known quotas are below the threshold, the highest remaining quota is still allowed.
-	MinimumQuotaPercent *float64 `yaml:"minimum-quota-percent,omitempty" json:"minimum-quota-percent,omitempty"`
+	QuotaReservePercent *float64 `yaml:"quota-reserve-percent,omitempty" json:"quota-reserve-percent,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,

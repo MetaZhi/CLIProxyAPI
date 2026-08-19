@@ -33,8 +33,8 @@ func quotaWindowMetadata(now time.Time, windows map[string]quotaWindowTestSpec) 
 	return map[string]any{quotaWindowsMetadataKey: out}
 }
 
-func withMinimumQuotaThresholds(auth *Auth, thresholds map[string]float64) *Auth {
-	SetOAuthMinimumQuotaPercentAttribute(auth, thresholds)
+func withQuotaReserveThresholds(auth *Auth, thresholds map[string]float64) *Auth {
+	SetOAuthQuotaReservePercentAttribute(auth, thresholds)
 	return auth
 }
 
@@ -324,17 +324,17 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_PerAuthMinimumQuotaSkipsHigherPriority(t *testing.T) {
+func TestRoundRobinSelectorPick_PerAuthWeeklyQuotaReserveSkipsHigherPriority(t *testing.T) {
 	t.Parallel()
 
 	selector := &RoundRobinSelector{}
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
-		withMinimumQuotaThresholds(&Auth{ID: "high-low-5h", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
-			"5h": {remainingPercent: 9, resetIn: 5 * time.Hour},
-		})}, map[string]float64{"5h": 10}),
+		withQuotaReserveThresholds(&Auth{ID: "high-low-week", Attributes: map[string]string{"priority": "10"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 9, resetIn: 7 * 24 * time.Hour},
+		})}, map[string]float64{"week": 10}),
 		{ID: "low-eligible", Attributes: map[string]string{"priority": "0"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
-			"5h": {remainingPercent: 50, resetIn: 5 * time.Hour},
+			"week": {remainingPercent: 50, resetIn: 7 * 24 * time.Hour},
 		})},
 	}
 
@@ -350,13 +350,13 @@ func TestRoundRobinSelectorPick_PerAuthMinimumQuotaSkipsHigherPriority(t *testin
 	}
 }
 
-func TestQuotaPrioritySelectorPick_PerAuthWeekThresholdBlocksFiveHourCandidate(t *testing.T) {
+func TestQuotaPrioritySelectorPick_PerAuthWeeklyThresholdBlocksCandidate(t *testing.T) {
 	t.Parallel()
 
 	selector := NewQuotaPrioritySelector(5 * time.Hour)
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
-		withMinimumQuotaThresholds(&Auth{ID: "blocked-week", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		withQuotaReserveThresholds(&Auth{ID: "blocked-week", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
 			"5h":   {remainingPercent: 90, resetIn: time.Hour},
 			"week": {remainingPercent: 10, resetIn: 7 * 24 * time.Hour},
 		})}, map[string]float64{"week": 20}),
@@ -378,13 +378,103 @@ func TestQuotaPrioritySelectorPick_PerAuthWeekThresholdBlocksFiveHourCandidate(t
 	}
 }
 
-func TestRoundRobinSelectorPick_UnknownPerAuthMinimumQuotaWindowSelectable(t *testing.T) {
+func TestQuotaPrioritySelectorPick_PerAccountWeeklyHeadroomBeatsPlanMultiplier(t *testing.T) {
+	t.Parallel()
+
+	selector := NewQuotaPrioritySelector(7 * 24 * time.Hour)
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		withQuotaReserveThresholds(&Auth{ID: "pro-at-reserve", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 84 * time.Hour},
+		})}, map[string]float64{"week": 100}),
+		withQuotaReserveThresholds(&Auth{ID: "plus-with-headroom", Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 51, resetIn: 84 * time.Hour},
+		})}, map[string]float64{"week": 100}),
+	}
+
+	got, errPick := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if got == nil || got.ID != "plus-with-headroom" {
+		t.Fatalf("Pick() auth = %v, want plus-with-headroom", got)
+	}
+}
+
+func TestQuotaReserveAvailableAt_RechecksWhenDynamicThresholdFalls(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	windowScore := quotaWindowScore{
+		RemainingPercent: 20,
+		ResetAt:          now.Add(84 * time.Hour),
+		ResetIn:          84 * time.Hour,
+		Window:           7 * 24 * time.Hour,
+	}
+
+	availableAt, blocked := quotaReserveAvailableAt(now, windowScore, 50)
+	if !blocked {
+		t.Fatal("quotaReserveAvailableAt() blocked = false, want true")
+	}
+	want := now.Add(16*time.Hour + 48*time.Minute)
+	if !availableAt.Equal(want) {
+		t.Fatalf("quotaReserveAvailableAt() = %s, want %s", availableAt, want)
+	}
+}
+
+func TestRoundRobinSelectorPick_PerAccountWeeklyThresholdOverridesGlobalMinimum(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{QuotaReservePercent: 80}
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		withQuotaReserveThresholds(&Auth{ID: "per-account", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 84 * time.Hour},
+		})}, map[string]float64{"week": 20}),
+		{ID: "global-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 7 * 24 * time.Hour},
+		})},
+	}
+
+	got, errPick := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if got == nil || got.ID != "per-account" {
+		t.Fatalf("Pick() auth = %v, want per-account", got)
+	}
+}
+
+func TestRoundRobinSelectorPick_PerAccountZeroThresholdOverridesGlobalMinimum(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{QuotaReservePercent: 80}
+	now := time.Now().UTC().Truncate(time.Second)
+	auths := []*Auth{
+		withQuotaReserveThresholds(&Auth{ID: "per-account-zero", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 10, resetIn: 7 * 24 * time.Hour},
+		})}, map[string]float64{"week": 0}),
+		{ID: "global-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 7 * 24 * time.Hour},
+		})},
+	}
+
+	got, errPick := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if got == nil || got.ID != "per-account-zero" {
+		t.Fatalf("Pick() auth = %v, want per-account-zero", got)
+	}
+}
+
+func TestRoundRobinSelectorPick_UnknownPerAuthQuotaReserveWindowSelectable(t *testing.T) {
 	t.Parallel()
 
 	selector := &RoundRobinSelector{}
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
-		{ID: "high-unknown-threshold", Attributes: map[string]string{"priority": "10", oauthMinimumQuotaPercentAttributeKey: `{"month":80}`}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+		{ID: "high-unknown-threshold", Attributes: map[string]string{"priority": "10", oauthQuotaReservePercentAttributeKey: `{"month":80}`}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
 			"month": {remainingPercent: 1, resetIn: 30 * 24 * time.Hour},
 		})},
 		{ID: "low", Attributes: map[string]string{"priority": "0"}},
@@ -488,10 +578,10 @@ func TestRemainingQuotaPercentFromMetadata(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_MinimumQuotaFiltersLowKnownQuota(t *testing.T) {
+func TestRoundRobinSelectorPick_QuotaReserveFiltersLowKnownQuota(t *testing.T) {
 	t.Parallel()
 
-	selector := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	selector := &RoundRobinSelector{QuotaReservePercent: 20}
 	auths := []*Auth{
 		{ID: "a-low", Metadata: map[string]any{"remaining_percent": 10}},
 		{ID: "b-unknown"},
@@ -513,10 +603,10 @@ func TestRoundRobinSelectorPick_MinimumQuotaFiltersLowKnownQuota(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T) {
+func TestRoundRobinSelectorPick_QuotaReserveAllLowUsesHighestQuota(t *testing.T) {
 	t.Parallel()
 
-	selector := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	selector := &RoundRobinSelector{QuotaReservePercent: 20}
 	auths := []*Auth{
 		{ID: "a-low", Metadata: map[string]any{"remaining_percent": 10}},
 		{ID: "b-highest-low", Metadata: map[string]any{"remaining_percent": 15}},
@@ -537,7 +627,7 @@ func TestRoundRobinSelectorPick_MinimumQuotaAllLowUsesHighestQuota(t *testing.T)
 	}
 }
 
-func TestMinimumQuotaAllowedAuthIDsAt_ScalesThresholdWithQuotaWindowTime(t *testing.T) {
+func TestQuotaReserveAllowedAuthIDsAt_ScalesThresholdWithQuotaWindowTime(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
@@ -553,7 +643,7 @@ func TestMinimumQuotaAllowedAuthIDsAt_ScalesThresholdWithQuotaWindowTime(t *test
 		})},
 	}
 
-	allowed := minimumQuotaAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
+	allowed := quotaReserveAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
 	if len(allowed) != 1 {
 		t.Fatalf("allowed auth count = %d, want 1", len(allowed))
 	}
@@ -562,11 +652,11 @@ func TestMinimumQuotaAllowedAuthIDsAt_ScalesThresholdWithQuotaWindowTime(t *test
 	}
 }
 
-func TestQuotaPrioritySelectorPick_ScalesMinimumQuotaWithWindowTime(t *testing.T) {
+func TestQuotaPrioritySelectorPick_ScalesQuotaReserveWithWindowTime(t *testing.T) {
 	t.Parallel()
 
 	selector := NewQuotaPrioritySelector(168 * time.Hour)
-	selector.MinimumQuotaPercent = 20
+	selector.QuotaReservePercent = 20
 	now := time.Now().UTC().Truncate(time.Second)
 	auths := []*Auth{
 		{ID: "full-window-low", RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
@@ -586,7 +676,7 @@ func TestQuotaPrioritySelectorPick_ScalesMinimumQuotaWithWindowTime(t *testing.T
 	}
 }
 
-func TestMinimumQuotaAllowedAuthIDsAt_UsesFixedThresholdWithoutTargetResetTime(t *testing.T) {
+func TestQuotaReserveAllowedAuthIDsAt_UsesFixedThresholdWithoutTargetResetTime(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
@@ -595,7 +685,7 @@ func TestMinimumQuotaAllowedAuthIDsAt_UsesFixedThresholdWithoutTargetResetTime(t
 		{ID: "eligible", Metadata: map[string]any{"remaining_percent": 20}},
 	}
 
-	allowed := minimumQuotaAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
+	allowed := quotaReserveAllowedAuthIDsAt(auths, 20, now, 168*time.Hour)
 	if len(allowed) != 1 {
 		t.Fatalf("allowed auth count = %d, want 1", len(allowed))
 	}
@@ -1691,10 +1781,10 @@ func TestSessionAffinitySelector_FailoverWhenAuthUnavailable(t *testing.T) {
 	}
 }
 
-func TestSessionAffinitySelector_MinimumQuotaCanReleaseCachedAuth(t *testing.T) {
+func TestSessionAffinitySelector_QuotaReserveCanReleaseCachedAuth(t *testing.T) {
 	t.Parallel()
 
-	fallback := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	fallback := &RoundRobinSelector{QuotaReservePercent: 20}
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: fallback,
 		TTL:      time.Minute,
@@ -1725,10 +1815,10 @@ func TestSessionAffinitySelector_MinimumQuotaCanReleaseCachedAuth(t *testing.T) 
 	}
 }
 
-func TestSessionAffinitySelector_MinimumQuotaAllLowKeepsHighestCachedAuth(t *testing.T) {
+func TestSessionAffinitySelector_QuotaReserveAllLowKeepsHighestCachedAuth(t *testing.T) {
 	t.Parallel()
 
-	fallback := &RoundRobinSelector{MinimumQuotaPercent: 20}
+	fallback := &RoundRobinSelector{QuotaReservePercent: 20}
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
 		Fallback: fallback,
 		TTL:      time.Minute,

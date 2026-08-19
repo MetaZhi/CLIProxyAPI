@@ -22,12 +22,12 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 }
 
 func TestQuotaPriorityRoutingSelectorTracksQuotaSettings(t *testing.T) {
-	minimumQuotaPercent := 20.0
+	quotaReservePercent := 20.0
 	state := normalizedRoutingRuntimeState(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:            "quota-priority",
 			QuotaPriorityWindow: "168h",
-			MinimumQuotaPercent: &minimumQuotaPercent,
+			QuotaReservePercent: &quotaReservePercent,
 		},
 	})
 	if state.strategy != "quota-priority" {
@@ -36,8 +36,8 @@ func TestQuotaPriorityRoutingSelectorTracksQuotaSettings(t *testing.T) {
 	if state.quotaPriorityWindow != 168*time.Hour {
 		t.Fatalf("quotaPriorityWindow = %v, want %v", state.quotaPriorityWindow, 168*time.Hour)
 	}
-	if state.minimumQuotaPercent != minimumQuotaPercent {
-		t.Fatalf("minimumQuotaPercent = %v, want %v", state.minimumQuotaPercent, minimumQuotaPercent)
+	if state.quotaReservePercent != quotaReservePercent {
+		t.Fatalf("quotaReservePercent = %v, want %v", state.quotaReservePercent, quotaReservePercent)
 	}
 
 	quotaSelector, ok := newRoutingSelectorFromRuntimeState(state).(*coreauth.QuotaPrioritySelector)
@@ -47,20 +47,20 @@ func TestQuotaPriorityRoutingSelectorTracksQuotaSettings(t *testing.T) {
 	if quotaSelector.Window != state.quotaPriorityWindow {
 		t.Fatalf("selector window = %v, want %v", quotaSelector.Window, state.quotaPriorityWindow)
 	}
-	if quotaSelector.MinimumQuotaPercent != state.minimumQuotaPercent {
-		t.Fatalf("selector minimum quota percent = %v, want %v", quotaSelector.MinimumQuotaPercent, state.minimumQuotaPercent)
+	if quotaSelector.QuotaReservePercent != state.quotaReservePercent {
+		t.Fatalf("selector quota reserve percent = %v, want %v", quotaSelector.QuotaReservePercent, state.quotaReservePercent)
 	}
 
-	updatedMinimumQuotaPercent := 30.0
+	updatedQuotaReservePercent := 30.0
 	updatedState := normalizedRoutingRuntimeState(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:            "quota-priority",
 			QuotaPriorityWindow: "168h",
-			MinimumQuotaPercent: &updatedMinimumQuotaPercent,
+			QuotaReservePercent: &updatedQuotaReservePercent,
 		},
 	})
 	if updatedState == state {
-		t.Fatal("routing state did not change after updating minimum quota percent")
+		t.Fatal("routing state did not change after updating quota reserve percent")
 	}
 }
 
@@ -68,12 +68,12 @@ func TestServiceAppliesUpdatedQuotaPriorityRoutingSettings(t *testing.T) {
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	service := &Service{coreManager: manager}
 
-	minimumQuotaPercent := 20.0
+	quotaReservePercent := 20.0
 	commit := service.commitConfigUpdate(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:            "quota-priority",
 			QuotaPriorityWindow: "168h",
-			MinimumQuotaPercent: &minimumQuotaPercent,
+			QuotaReservePercent: &quotaReservePercent,
 		},
 	})
 	if !service.applyManagerConfig(context.Background(), commit) {
@@ -84,16 +84,16 @@ func TestServiceAppliesUpdatedQuotaPriorityRoutingSettings(t *testing.T) {
 	if !ok {
 		t.Fatalf("selector type = %T, want *auth.QuotaPrioritySelector", manager.Selector())
 	}
-	if quotaSelector.MinimumQuotaPercent != minimumQuotaPercent {
-		t.Fatalf("initial selector minimum quota percent = %v, want %v", quotaSelector.MinimumQuotaPercent, minimumQuotaPercent)
+	if quotaSelector.QuotaReservePercent != quotaReservePercent {
+		t.Fatalf("initial selector quota reserve percent = %v, want %v", quotaSelector.QuotaReservePercent, quotaReservePercent)
 	}
 
-	updatedMinimumQuotaPercent := 30.0
+	updatedQuotaReservePercent := 30.0
 	updatedCommit := service.commitConfigUpdate(&internalconfig.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:            "quota-priority",
 			QuotaPriorityWindow: "168h",
-			MinimumQuotaPercent: &updatedMinimumQuotaPercent,
+			QuotaReservePercent: &updatedQuotaReservePercent,
 		},
 	})
 	if !service.applyManagerConfig(context.Background(), updatedCommit) {
@@ -104,8 +104,8 @@ func TestServiceAppliesUpdatedQuotaPriorityRoutingSettings(t *testing.T) {
 	if !ok {
 		t.Fatalf("updated selector type = %T, want *auth.QuotaPrioritySelector", manager.Selector())
 	}
-	if updatedSelector.MinimumQuotaPercent != updatedMinimumQuotaPercent {
-		t.Fatalf("updated selector minimum quota percent = %v, want %v", updatedSelector.MinimumQuotaPercent, updatedMinimumQuotaPercent)
+	if updatedSelector.QuotaReservePercent != updatedQuotaReservePercent {
+		t.Fatalf("updated selector quota reserve percent = %v, want %v", updatedSelector.QuotaReservePercent, updatedQuotaReservePercent)
 	}
 }
 

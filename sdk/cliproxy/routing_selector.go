@@ -33,18 +33,18 @@ func routingQuotaPriorityWindow(cfg *config.Config, warnf func(string, ...any)) 
 	return coreauth.DefaultQuotaPriorityWindow
 }
 
-func routingMinimumQuotaPercent(cfg *config.Config, warnf func(string, ...any)) float64 {
+func routingQuotaReservePercent(cfg *config.Config, warnf func(string, ...any)) float64 {
 	if cfg == nil {
-		return coreauth.DefaultMinimumQuotaPercent
+		return coreauth.DefaultQuotaReservePercent
 	}
-	percent, err := coreauth.MinimumQuotaPercentFromConfig(cfg.Routing.MinimumQuotaPercent)
+	percent, err := coreauth.QuotaReservePercentFromConfig(cfg.Routing.QuotaReservePercent)
 	if err == nil {
 		return percent
 	}
 	if warnf != nil {
-		warnf("invalid routing.minimum-quota-percent, using default %.0f: %v", coreauth.DefaultMinimumQuotaPercent, err)
+		warnf("invalid routing.quota-reserve-percent, using default %.0f: %v", coreauth.DefaultQuotaReservePercent, err)
 	}
-	return coreauth.DefaultMinimumQuotaPercent
+	return coreauth.DefaultQuotaReservePercent
 }
 
 func routingSessionAffinityTTL(cfg *config.Config) time.Duration {
@@ -64,19 +64,19 @@ func newRoutingSelector(cfg *config.Config, warnf func(string, ...any)) coreauth
 	if cfg != nil {
 		strategy = normalizeRoutingStrategyValue(cfg.Routing.Strategy)
 	}
-	minimumQuotaPercent := routingMinimumQuotaPercent(cfg, warnf)
+	quotaReservePercent := routingQuotaReservePercent(cfg, warnf)
 
 	var selector coreauth.Selector
 	switch strategy {
 	case "fill-first":
-		selector = &coreauth.FillFirstSelector{MinimumQuotaPercent: minimumQuotaPercent}
+		selector = &coreauth.FillFirstSelector{QuotaReservePercent: quotaReservePercent}
 	case "quota-priority":
 		selector = coreauth.NewQuotaPrioritySelector(routingQuotaPriorityWindow(cfg, warnf))
 		if quotaSelector, ok := selector.(*coreauth.QuotaPrioritySelector); ok {
-			quotaSelector.MinimumQuotaPercent = minimumQuotaPercent
+			quotaSelector.QuotaReservePercent = quotaReservePercent
 		}
 	default:
-		selector = &coreauth.RoundRobinSelector{MinimumQuotaPercent: minimumQuotaPercent}
+		selector = &coreauth.RoundRobinSelector{QuotaReservePercent: quotaReservePercent}
 	}
 
 	if cfg != nil && cfg.Routing.SessionAffinity {

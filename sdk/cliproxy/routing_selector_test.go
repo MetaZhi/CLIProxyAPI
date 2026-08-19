@@ -58,7 +58,7 @@ func TestNewRoutingSelector_InvalidQuotaWindowFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestNewRoutingSelector_MinimumQuotaPercentDefaultsToZero(t *testing.T) {
+func TestNewRoutingSelector_QuotaReservePercentDefaultsToZero(t *testing.T) {
 	t.Parallel()
 
 	selector := newRoutingSelector(&config.Config{}, nil)
@@ -67,20 +67,20 @@ func TestNewRoutingSelector_MinimumQuotaPercentDefaultsToZero(t *testing.T) {
 	if !ok {
 		t.Fatalf("selector = %T, want *coreauth.RoundRobinSelector", selector)
 	}
-	if roundRobin.MinimumQuotaPercent != coreauth.DefaultMinimumQuotaPercent {
-		t.Fatalf("MinimumQuotaPercent = %v, want %v", roundRobin.MinimumQuotaPercent, coreauth.DefaultMinimumQuotaPercent)
+	if roundRobin.QuotaReservePercent != coreauth.DefaultQuotaReservePercent {
+		t.Fatalf("QuotaReservePercent = %v, want %v", roundRobin.QuotaReservePercent, coreauth.DefaultQuotaReservePercent)
 	}
-	if roundRobin.MinimumQuotaPercent != 0 {
-		t.Fatalf("MinimumQuotaPercent = %v, want 0", roundRobin.MinimumQuotaPercent)
+	if roundRobin.QuotaReservePercent != 0 {
+		t.Fatalf("QuotaReservePercent = %v, want 0", roundRobin.QuotaReservePercent)
 	}
 }
 
-func TestNewRoutingSelector_MinimumQuotaPercentCanBeDisabled(t *testing.T) {
+func TestNewRoutingSelector_QuotaReservePercentCanBeDisabled(t *testing.T) {
 	t.Parallel()
 
 	selector := newRoutingSelector(&config.Config{
 		Routing: internalconfig.RoutingConfig{
-			MinimumQuotaPercent: routingTestFloat64Ptr(0),
+			QuotaReservePercent: routingTestFloat64Ptr(0),
 		},
 	}, nil)
 
@@ -88,19 +88,19 @@ func TestNewRoutingSelector_MinimumQuotaPercentCanBeDisabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("selector = %T, want *coreauth.RoundRobinSelector", selector)
 	}
-	if roundRobin.MinimumQuotaPercent != 0 {
-		t.Fatalf("MinimumQuotaPercent = %v, want 0", roundRobin.MinimumQuotaPercent)
+	if roundRobin.QuotaReservePercent != 0 {
+		t.Fatalf("QuotaReservePercent = %v, want 0", roundRobin.QuotaReservePercent)
 	}
 }
 
-func TestNewRoutingSelector_InvalidMinimumQuotaPercentFallsBackToDefault(t *testing.T) {
+func TestNewRoutingSelector_InvalidQuotaReservePercentFallsBackToDefault(t *testing.T) {
 	t.Parallel()
 
 	var warnings []string
 	selector := newRoutingSelector(&config.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:            "quota-priority",
-			MinimumQuotaPercent: routingTestFloat64Ptr(101),
+			QuotaReservePercent: routingTestFloat64Ptr(101),
 		},
 	}, func(format string, args ...any) {
 		warnings = append(warnings, format)
@@ -110,10 +110,10 @@ func TestNewRoutingSelector_InvalidMinimumQuotaPercentFallsBackToDefault(t *test
 	if !ok {
 		t.Fatalf("selector = %T, want *coreauth.QuotaPrioritySelector", selector)
 	}
-	if quotaSelector.MinimumQuotaPercent != coreauth.DefaultMinimumQuotaPercent {
-		t.Fatalf("MinimumQuotaPercent = %v, want %v", quotaSelector.MinimumQuotaPercent, coreauth.DefaultMinimumQuotaPercent)
+	if quotaSelector.QuotaReservePercent != coreauth.DefaultQuotaReservePercent {
+		t.Fatalf("QuotaReservePercent = %v, want %v", quotaSelector.QuotaReservePercent, coreauth.DefaultQuotaReservePercent)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "invalid routing.minimum-quota-percent") {
-		t.Fatalf("warnings = %#v, want invalid minimum quota warning", warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "invalid routing.quota-reserve-percent") {
+		t.Fatalf("warnings = %#v, want invalid quota reserve warning", warnings)
 	}
 }

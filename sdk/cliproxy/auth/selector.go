@@ -28,7 +28,7 @@ const DefaultQuotaPriorityWindowString = "168h"
 
 var DefaultQuotaPriorityWindow = mustParseQuotaPriorityDefaultWindow()
 
-const DefaultMinimumQuotaPercent = 0.0
+const DefaultQuotaReservePercent = 0.0
 const quotaPriorityScoreMinMinutes = 1.0
 const quotaWarmupInFlightCooldown = 2 * time.Minute
 const quotaWarmupMissingHeadersCooldown = time.Minute
@@ -41,7 +41,7 @@ type RoundRobinSelector struct {
 	mu                  sync.Mutex
 	cursors             map[string]int
 	maxKeys             int
-	MinimumQuotaPercent float64
+	QuotaReservePercent float64
 }
 
 // WeightedRoundRobinSelector provides smooth weighted round-robin selection.
@@ -78,16 +78,17 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct {
-	MinimumQuotaPercent float64
+	QuotaReservePercent float64
 }
 
 // QuotaPrioritySelector prioritizes credentials with quota window metadata.
-// Selection uses the highest remaining-quota-per-reset-minute score from
-// runtime quota_windows observed from upstream response headers.
+// Selection uses the highest spendable-quota-per-reset-minute score from
+// runtime quota_windows observed from upstream response headers. Per-account
+// weekly reserves are excluded from the spendable quota before scoring.
 // If no credential has scoreable quota window data, selection falls back to round-robin.
 type QuotaPrioritySelector struct {
 	Window              time.Duration
-	MinimumQuotaPercent float64
+	QuotaReservePercent float64
 	roundRobin          RoundRobinSelector
 }
 
@@ -299,31 +300,16 @@ func quotaAvailabilityBlockedUntil(auth *Auth, now time.Time, quotaExhaustionWin
 			latest = laterTime(latest, resetAt)
 		}
 	}
-	for windowName, threshold := range OAuthMinimumQuotaPercentFromAttributes(auth.Attributes) {
-		duration, okDuration := oauthMinimumQuotaWindowDuration(windowName)
-		if !okDuration || threshold <= 0 {
-			continue
-		}
-		windowScore, okScore := bestQuotaWindowScore(auth, now, duration)
-		if !okScore || !windowScore.ResetAt.After(now) {
-			continue
-		}
-		if windowScore.RemainingPercent < threshold {
-			latest = laterTime(latest, windowScore.ResetAt)
+	if threshold, configured := oauthWeeklyQuotaReservePercent(auth.Attributes); configured {
+		windowScore, okScore := bestQuotaWindowScore(auth, now, 7*24*time.Hour)
+		if okScore && windowScore.ResetAt.After(now) &&
+			windowScore.RemainingPercent < scaleQuotaReservePercent(threshold, windowScore.ResetIn, windowScore.Window) {
+			if availableAt, blocked := quotaReserveAvailableAt(now, windowScore, threshold); blocked {
+				latest = laterTime(latest, availableAt)
+			}
 		}
 	}
 	return latest, !latest.IsZero()
-}
-
-func oauthMinimumQuotaWindowDuration(window string) (time.Duration, bool) {
-	switch window {
-	case "5h":
-		return 5 * time.Hour, true
-	case "week":
-		return 7 * 24 * time.Hour, true
-	default:
-		return 0, false
-	}
 }
 
 func laterTime(current, candidate time.Time) time.Time {
@@ -601,46 +587,46 @@ func highestPriorityAuths(auths []*Auth) []*Auth {
 	return highest
 }
 
-func getSelectableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time, minimumQuotaPercent float64, quotaExhaustionWindow time.Duration) ([]*Auth, error) {
-	return getSelectableAuthsWithPriorityMode(ctx, auths, provider, model, now, minimumQuotaPercent, quotaExhaustionWindow, false)
+func getSelectableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time, quotaReservePercent float64, quotaExhaustionWindow time.Duration) ([]*Auth, error) {
+	return getSelectableAuthsWithPriorityMode(ctx, auths, provider, model, now, quotaReservePercent, quotaExhaustionWindow, false)
 }
 
-func getSelectableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, provider, model string, now time.Time, minimumQuotaPercent float64, quotaExhaustionWindow time.Duration, allPriorities bool) ([]*Auth, error) {
+func getSelectableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, provider, model string, now time.Time, quotaReservePercent float64, quotaExhaustionWindow time.Duration, allPriorities bool) ([]*Auth, error) {
 	available, err := getAvailableAuthsWithPriorityMode(auths, provider, model, now, quotaExhaustionWindow, allPriorities)
 	if err != nil {
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = filterAuthsByMinimumQuota(available, minimumQuotaPercent, now, quotaExhaustionWindow)
+	available = filterAuthsByQuotaReserve(available, quotaReservePercent, now, quotaExhaustionWindow)
 	entry := selectorLogEntry(ctx)
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		logWindow := quotaExhaustionWindow
 		if logWindow <= 0 {
 			logWindow = DefaultQuotaPriorityWindow
 		}
-		entry.Debugf("routing selectable auths | provider=%s model=%s candidates=%d selectable=%d minimum_quota_percent=%.2f quota_exhaustion_window=%s auths=%s",
-			provider, model, len(auths), len(available), normalizeMinimumQuotaPercent(minimumQuotaPercent), logWindow, formatAuthSelectionCandidates(available, now, logWindow))
+		entry.Debugf("routing selectable auths | provider=%s model=%s candidates=%d selectable=%d quota_reserve_percent=%.2f quota_exhaustion_window=%s auths=%s",
+			provider, model, len(auths), len(available), normalizeQuotaReservePercent(quotaReservePercent), logWindow, formatAuthSelectionCandidates(available, now, logWindow))
 	}
 	return available, nil
 }
 
-func MinimumQuotaPercentFromConfig(value *float64) (float64, error) {
+func QuotaReservePercentFromConfig(value *float64) (float64, error) {
 	if value == nil {
-		return DefaultMinimumQuotaPercent, nil
+		return DefaultQuotaReservePercent, nil
 	}
 	percent := *value
 	if math.IsNaN(percent) || math.IsInf(percent, 0) {
-		return 0, fmt.Errorf("minimum quota percent must be finite")
+		return 0, fmt.Errorf("quota reserve percent must be finite")
 	}
 	if percent < 0 || percent > 100 {
-		return 0, fmt.Errorf("minimum quota percent must be between 0 and 100")
+		return 0, fmt.Errorf("quota reserve percent must be between 0 and 100")
 	}
 	return percent, nil
 }
 
-func normalizeMinimumQuotaPercent(percent float64) float64 {
+func normalizeQuotaReservePercent(percent float64) float64 {
 	if math.IsNaN(percent) || math.IsInf(percent, 0) || percent < 0 || percent > 100 {
-		return DefaultMinimumQuotaPercent
+		return DefaultQuotaReservePercent
 	}
 	return percent
 }
@@ -833,7 +819,14 @@ func bestQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) (quot
 		if remainingMinutes < quotaPriorityScoreMinMinutes {
 			remainingMinutes = quotaPriorityScoreMinMinutes
 		}
-		score := percent * multiplier / remainingMinutes
+		spendablePercent := percent
+		if threshold, configured := oauthWeeklyQuotaReservePercent(auth.Attributes); configured && windowDuration == 7*24*time.Hour {
+			spendablePercent -= scaleQuotaReservePercent(threshold, resetIn, windowDuration)
+			if spendablePercent < 0 {
+				spendablePercent = 0
+			}
+		}
+		score := spendablePercent * multiplier / remainingMinutes
 		current := quotaWindowScore{
 			Name:             strings.TrimSpace(name),
 			RemainingPercent: percent,
@@ -1002,12 +995,12 @@ func finiteQuotaFloat(value float64) (float64, bool) {
 	return value, true
 }
 
-func minimumQuotaAllowedAuthIDs(auths []*Auth, threshold float64) map[string]struct{} {
-	return minimumQuotaAllowedAuthIDsAt(auths, threshold, time.Now(), 0)
+func quotaReserveAllowedAuthIDs(auths []*Auth, threshold float64) map[string]struct{} {
+	return quotaReserveAllowedAuthIDsAt(auths, threshold, time.Now(), 0)
 }
 
-func minimumQuotaAllowedAuthIDsAt(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) map[string]struct{} {
-	threshold = normalizeMinimumQuotaPercent(threshold)
+func quotaReserveAllowedAuthIDsAt(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) map[string]struct{} {
+	threshold = normalizeQuotaReservePercent(threshold)
 	if threshold <= 0 || len(auths) == 0 {
 		return nil
 	}
@@ -1019,7 +1012,11 @@ func minimumQuotaAllowedAuthIDsAt(auths []*Auth, threshold float64, now time.Tim
 		if auth == nil {
 			continue
 		}
-		percent, effectiveThreshold, ok := minimumQuotaForAuth(auth, now, threshold, quotaWindow)
+		if _, configured := oauthWeeklyQuotaReservePercent(auth.Attributes); configured {
+			eligible[auth.ID] = struct{}{}
+			continue
+		}
+		percent, effectiveThreshold, ok := quotaReserveForAuth(auth, now, threshold, quotaWindow)
 		if !ok {
 			unknown[auth.ID] = struct{}{}
 			continue
@@ -1057,10 +1054,10 @@ func minimumQuotaAllowedAuthIDsAt(auths []*Auth, threshold float64, now time.Tim
 	return allowed
 }
 
-func minimumQuotaForAuth(auth *Auth, now time.Time, threshold float64, quotaWindow time.Duration) (remainingPercent, effectiveThreshold float64, ok bool) {
+func quotaReserveForAuth(auth *Auth, now time.Time, threshold float64, quotaWindow time.Duration) (remainingPercent, effectiveThreshold float64, ok bool) {
 	if quotaWindow > 0 {
 		if score, okScore := bestQuotaWindowScore(auth, now, quotaWindow); okScore && score.Window > 0 {
-			return score.RemainingPercent, scaleMinimumQuotaPercent(threshold, score.ResetIn, score.Window), true
+			return score.RemainingPercent, scaleQuotaReservePercent(threshold, score.ResetIn, score.Window), true
 		}
 	}
 
@@ -1068,8 +1065,8 @@ func minimumQuotaForAuth(auth *Auth, now time.Time, threshold float64, quotaWind
 	return percent, threshold, okPercent
 }
 
-func scaleMinimumQuotaPercent(threshold float64, resetIn, window time.Duration) float64 {
-	threshold = normalizeMinimumQuotaPercent(threshold)
+func scaleQuotaReservePercent(threshold float64, resetIn, window time.Duration) float64 {
+	threshold = normalizeQuotaReservePercent(threshold)
 	if threshold <= 0 || resetIn <= 0 {
 		return 0
 	}
@@ -1079,8 +1076,27 @@ func scaleMinimumQuotaPercent(threshold float64, resetIn, window time.Duration) 
 	return threshold * float64(resetIn) / float64(window)
 }
 
-func filterAuthsByMinimumQuota(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) []*Auth {
-	allowed := minimumQuotaAllowedAuthIDsAt(auths, threshold, now, quotaWindow)
+func quotaReserveAvailableAt(now time.Time, windowScore quotaWindowScore, threshold float64) (time.Time, bool) {
+	threshold = normalizeQuotaReservePercent(threshold)
+	if threshold <= 0 || windowScore.Window <= 0 || windowScore.ResetIn <= 0 {
+		return time.Time{}, false
+	}
+	if windowScore.RemainingPercent >= scaleQuotaReservePercent(threshold, windowScore.ResetIn, windowScore.Window) {
+		return time.Time{}, false
+	}
+	remainingResetIn := time.Duration(float64(windowScore.Window) * windowScore.RemainingPercent / threshold)
+	if remainingResetIn < 0 {
+		remainingResetIn = 0
+	}
+	availableAt := windowScore.ResetAt.Add(-remainingResetIn)
+	if !availableAt.After(now) {
+		return time.Time{}, false
+	}
+	return availableAt, true
+}
+
+func filterAuthsByQuotaReserve(auths []*Auth, threshold float64, now time.Time, quotaWindow time.Duration) []*Auth {
+	allowed := quotaReserveAllowedAuthIDsAt(auths, threshold, now, quotaWindow)
 	if allowed == nil {
 		return auths
 	}
@@ -1230,14 +1246,14 @@ func quotaPrioritySelectedLogFields(auth *Auth, now time.Time, window time.Durat
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent, 0)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.QuotaReservePercent, 0)
 	if err != nil {
 		return nil, err
 	}
-	return s.pickAvailable(ctx, provider, model, available, s.MinimumQuotaPercent)
+	return s.pickAvailable(ctx, provider, model, available, s.QuotaReservePercent)
 }
 
-func (s *RoundRobinSelector) pickAvailable(ctx context.Context, provider, model string, available []*Auth, minimumQuotaPercent float64) (*Auth, error) {
+func (s *RoundRobinSelector) pickAvailable(ctx context.Context, provider, model string, available []*Auth, quotaReservePercent float64) (*Auth, error) {
 	if len(available) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -1259,8 +1275,8 @@ func (s *RoundRobinSelector) pickAvailable(ctx context.Context, provider, model 
 	s.cursors[key] = index + 1
 	s.mu.Unlock()
 	selected := available[index%len(available)]
-	selectorLogEntry(ctx).Infof("routing selector: selected | strategy=round-robin auth=%s provider=%s model=%s selectable=%d cursor=%d minimum_quota_percent=%.2f",
-		selected.ID, provider, model, len(available), index, normalizeMinimumQuotaPercent(minimumQuotaPercent))
+	selectorLogEntry(ctx).Infof("routing selector: selected | strategy=round-robin auth=%s provider=%s model=%s selectable=%d cursor=%d quota_reserve_percent=%.2f",
+		selected.ID, provider, model, len(available), index, normalizeQuotaReservePercent(quotaReservePercent))
 	return selected, nil
 }
 
@@ -1394,13 +1410,13 @@ func saturatingAddInt64(value, delta int64) int64 {
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
-	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent, 0)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.QuotaReservePercent, 0)
 	if err != nil {
 		return nil, err
 	}
 	selected := available[0]
-	selectorLogEntry(ctx).Infof("routing selector: selected | strategy=fill-first auth=%s provider=%s model=%s selectable=%d minimum_quota_percent=%.2f",
-		selected.ID, provider, model, len(available), normalizeMinimumQuotaPercent(s.MinimumQuotaPercent))
+	selectorLogEntry(ctx).Infof("routing selector: selected | strategy=fill-first auth=%s provider=%s model=%s selectable=%d quota_reserve_percent=%.2f",
+		selected.ID, provider, model, len(available), normalizeQuotaReservePercent(s.QuotaReservePercent))
 	return selected, nil
 }
 
@@ -1418,20 +1434,20 @@ func (s *QuotaPrioritySelector) quotaPriorityWindow() time.Duration {
 func (s *QuotaPrioritySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	now := time.Now()
 	quotaWindow := s.quotaPriorityWindow()
-	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.MinimumQuotaPercent, quotaWindow)
+	available, err := getSelectableAuths(ctx, auths, provider, model, now, s.QuotaReservePercent, quotaWindow)
 	if err != nil {
 		return nil, err
 	}
 	if picked, ok := pickQuotaWarmupAuth(available, now, quotaWindow); ok {
 		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow)
-		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-warmup auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s minimum_quota_percent=%.2f",
-			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown, normalizeMinimumQuotaPercent(s.MinimumQuotaPercent))
+		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-warmup auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s quota_reserve_percent=%.2f",
+			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown, normalizeQuotaReservePercent(s.QuotaReservePercent))
 		return picked, nil
 	}
 	if picked, ok := pickQuotaPriorityAuth(available, now, quotaWindow); ok {
 		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow)
-		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-window auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s minimum_quota_percent=%.2f",
-			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, normalizeMinimumQuotaPercent(s.MinimumQuotaPercent))
+		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-window auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s quota_reserve_percent=%.2f",
+			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, normalizeQuotaReservePercent(s.QuotaReservePercent))
 		return picked, nil
 	}
 	entry := selectorLogEntry(ctx)
@@ -1439,7 +1455,7 @@ func (s *QuotaPrioritySelector) Pick(ctx context.Context, provider, model string
 		entry.Debugf("routing selector: no quota-priority candidates, falling back to round-robin | provider=%s model=%s selectable=%d quota_priority_window=%s auths=%s",
 			provider, model, len(available), quotaWindow, formatAuthSelectionCandidates(available, now, quotaWindow))
 	}
-	return (&s.roundRobin).pickAvailable(ctx, provider, model, available, s.MinimumQuotaPercent)
+	return (&s.roundRobin).pickAvailable(ctx, provider, model, available, s.QuotaReservePercent)
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
@@ -1577,7 +1593,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getSelectableAuths(ctx, availabilityCandidates, provider, model, now, selectorMinimumQuotaPercent(s.fallback), quotaWindow)
+		fallbackAuths, errAvailable := getSelectableAuths(ctx, availabilityCandidates, provider, model, now, selectorQuotaReservePercent(s.fallback), quotaWindow)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
@@ -1587,7 +1603,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	// A single availability pass serves both lookups: the bound credential is validated against
 	// every priority tier, while the fallback selector keeps seeing only the highest tier.
-	available, err := getSelectableAuthsWithPriorityMode(ctx, availabilityCandidates, provider, model, now, selectorMinimumQuotaPercent(s.fallback), quotaWindow, true)
+	available, err := getSelectableAuthsWithPriorityMode(ctx, availabilityCandidates, provider, model, now, selectorQuotaReservePercent(s.fallback), quotaWindow, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1615,8 +1631,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		if entry.Logger.IsLevelEnabled(log.DebugLevel) {
-			entry.Debugf("session-affinity: cached auth not selectable | session=%s cached_auth=%s provider=%s model=%s selectable=%d minimum_quota_percent=%.2f selectable_auths=%s",
-				truncateSessionID(primaryID), cachedAuthID, provider, model, len(available), selectorMinimumQuotaPercent(s.fallback), formatAuthSelectionCandidates(available, now, quotaWindow))
+			entry.Debugf("session-affinity: cached auth not selectable | session=%s cached_auth=%s provider=%s model=%s selectable=%d quota_reserve_percent=%.2f selectable_auths=%s",
+				truncateSessionID(primaryID), cachedAuthID, provider, model, len(available), selectorQuotaReservePercent(s.fallback), formatAuthSelectionCandidates(available, now, quotaWindow))
 		}
 		// Cached auth not selectable, reselect via fallback selector for even distribution.
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)

@@ -377,24 +377,24 @@ func (h *Handler) PutRoutingQuotaPriorityWindow(c *gin.Context) {
 	h.persist(c)
 }
 
-func normalizeMinimumQuotaPercent(value *float64) (float64, bool) {
-	percent, err := coreauth.MinimumQuotaPercentFromConfig(value)
+func normalizeQuotaReservePercent(value *float64) (float64, bool) {
+	percent, err := coreauth.QuotaReservePercentFromConfig(value)
 	if err != nil {
 		return 0, false
 	}
 	return percent, true
 }
 
-// RoutingMinimumQuotaPercent
-func (h *Handler) GetRoutingMinimumQuotaPercent(c *gin.Context) {
-	value, ok := normalizeMinimumQuotaPercent(h.cfg.Routing.MinimumQuotaPercent)
+// RoutingQuotaReservePercent
+func (h *Handler) GetRoutingQuotaReservePercent(c *gin.Context) {
+	value, ok := normalizeQuotaReservePercent(h.cfg.Routing.QuotaReservePercent)
 	if !ok {
-		value = coreauth.DefaultMinimumQuotaPercent
+		value = coreauth.DefaultQuotaReservePercent
 	}
-	c.JSON(200, gin.H{"minimum-quota-percent": value})
+	c.JSON(200, gin.H{"quota-reserve-percent": value})
 }
 
-func (h *Handler) PutRoutingMinimumQuotaPercent(c *gin.Context) {
+func (h *Handler) PutRoutingQuotaReservePercent(c *gin.Context) {
 	var body struct {
 		Value *float64 `json:"value"`
 	}
@@ -404,10 +404,10 @@ func (h *Handler) PutRoutingMinimumQuotaPercent(c *gin.Context) {
 	}
 	value := *body.Value
 	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 100 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid minimum-quota-percent"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quota-reserve-percent"})
 		return
 	}
-	h.cfg.Routing.MinimumQuotaPercent = &value
+	h.cfg.Routing.QuotaReservePercent = &value
 	h.persist(c)
 }
 

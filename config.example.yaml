@@ -210,12 +210,12 @@ routing:
   # reset minute, and falls back to round-robin when quota window data is missing.
   # Default: 168h (weekly Codex quota window)
   quota-priority-window: "168h"
-  # Soft minimum known remaining quota percent before rotating to lower-quota accounts.
+  # Soft quota reserve percentage before routing to accounts with lower remaining quota.
   # With quota-priority and matching reset data, this threshold scales linearly with
   # the remaining quota window: at half of the window, a 20% threshold becomes 10%.
   # When reset data is unavailable, the configured threshold is used unchanged.
   # Set to 0 to disable quota-aware filtering. Default: 0
-  minimum-quota-percent: 0
+  quota-reserve-percent: 0
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,

@@ -139,9 +139,9 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		if errWindow == nil {
 			m.scheduler.setQuotaPriorityWindow(quotaWindow)
 		}
-		minimumQuotaPercent, errMinimumQuota := MinimumQuotaPercentFromConfig(cfg.Routing.MinimumQuotaPercent)
-		if errMinimumQuota == nil {
-			m.scheduler.setMinimumQuotaPercent(minimumQuotaPercent)
+		quotaReservePercent, errQuotaReserve := QuotaReservePercentFromConfig(cfg.Routing.QuotaReservePercent)
+		if errQuotaReserve == nil {
+			m.scheduler.setQuotaReservePercent(quotaReservePercent)
 		}
 	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)

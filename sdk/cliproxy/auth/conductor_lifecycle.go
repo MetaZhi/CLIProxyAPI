@@ -75,7 +75,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
-	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
+	ApplyOAuthQuotaReservePercentFromMetadata(auth)
 	now := time.Now()
 	cooldownStateChanged := normalizeModelStates(auth)
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -109,7 +109,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
-	ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
+	ApplyOAuthQuotaReservePercentFromMetadata(auth)
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
@@ -242,7 +242,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
-		ApplyOAuthMinimumQuotaPercentFromMetadata(auth)
+		ApplyOAuthQuotaReservePercentFromMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
