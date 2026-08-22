@@ -716,6 +716,31 @@ func TestSchedulerPick_QuotaPriorityPrefersPerAccountWeeklyHeadroom(t *testing.T
 	}
 }
 
+func TestSchedulerPick_QuotaPriorityAppliesGlobalWeeklyReserveToScore(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	selector := NewQuotaPrioritySelector(7 * 24 * time.Hour)
+	selector.QuotaReservePercent = 80
+	scheduler := newSchedulerForTest(
+		selector,
+		&Auth{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 84 * time.Hour},
+		})},
+		&Auth{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 90, resetIn: 84 * time.Hour},
+		})},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "prolite" {
+		t.Fatalf("pickSingle() auth = %v, want prolite", got)
+	}
+}
+
 func TestSchedulerPick_QuotaPriorityAppliesQuotaReserveBeforeQuota(t *testing.T) {
 	t.Parallel()
 

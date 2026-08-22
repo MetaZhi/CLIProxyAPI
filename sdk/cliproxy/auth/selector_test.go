@@ -939,6 +939,30 @@ func TestQuotaPrioritySelectorPick_AppliesCodexPlanCapacityMultiplier(t *testing
 	})
 }
 
+func TestQuotaPrioritySelectorPick_AppliesGlobalWeeklyReserveToScore(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	selector := NewQuotaPrioritySelector(7 * 24 * time.Hour)
+	selector.QuotaReservePercent = 80
+	auths := []*Auth{
+		{ID: "pro", Provider: "codex", Attributes: map[string]string{"plan_type": "pro"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 50, resetIn: 84 * time.Hour},
+		})},
+		{ID: "prolite", Provider: "codex", Attributes: map[string]string{"plan_type": "prolite"}, RuntimeMetadata: quotaWindowMetadata(now, map[string]quotaWindowTestSpec{
+			"week": {remainingPercent: 90, resetIn: 84 * time.Hour},
+		})},
+	}
+
+	got, errPick := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+	if errPick != nil {
+		t.Fatalf("Pick() error = %v", errPick)
+	}
+	if got == nil || got.ID != "prolite" {
+		t.Fatalf("Pick() auth = %v, want prolite", got)
+	}
+}
+
 func TestQuotaCapacityMultiplier(t *testing.T) {
 	t.Parallel()
 
@@ -1098,7 +1122,7 @@ func TestPickQuotaPriorityAuth_QuotaScoreTieBreaksByResetThenID(t *testing.T) {
 			})},
 		}
 
-		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour)
+		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour, 0)
 		if !ok {
 			t.Fatalf("pickQuotaPriorityAuth() ok = false")
 		}
@@ -1120,7 +1144,7 @@ func TestPickQuotaPriorityAuth_QuotaScoreTieBreaksByResetThenID(t *testing.T) {
 			})},
 		}
 
-		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour)
+		got, ok := pickQuotaPriorityAuth(auths, now, 5*time.Hour, 0)
 		if !ok {
 			t.Fatalf("pickQuotaPriorityAuth() ok = false")
 		}

@@ -83,8 +83,8 @@ type FillFirstSelector struct {
 
 // QuotaPrioritySelector prioritizes credentials with quota window metadata.
 // Selection uses the highest spendable-quota-per-reset-minute score from
-// runtime quota_windows observed from upstream response headers. Per-account
-// weekly reserves are excluded from the spendable quota before scoring.
+// runtime quota_windows observed from upstream response headers. Global and
+// per-account weekly reserves are excluded from the spendable quota before scoring.
 // If no credential has scoreable quota window data, selection falls back to round-robin.
 type QuotaPrioritySelector struct {
 	Window              time.Duration
@@ -605,7 +605,7 @@ func getSelectableAuthsWithPriorityMode(ctx context.Context, auths []*Auth, prov
 			logWindow = DefaultQuotaPriorityWindow
 		}
 		entry.Debugf("routing selectable auths | provider=%s model=%s candidates=%d selectable=%d quota_reserve_percent=%.2f quota_exhaustion_window=%s auths=%s",
-			provider, model, len(auths), len(available), normalizeQuotaReservePercent(quotaReservePercent), logWindow, formatAuthSelectionCandidates(available, now, logWindow))
+			provider, model, len(auths), len(available), normalizeQuotaReservePercent(quotaReservePercent), logWindow, formatAuthSelectionCandidates(available, now, logWindow, quotaReservePercent))
 	}
 	return available, nil
 }
@@ -787,6 +787,10 @@ func quotaWindowResetAtFromMap(meta map[string]any) (time.Time, bool) {
 }
 
 func bestQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) (quotaWindowScore, bool) {
+	return bestQuotaWindowScoreWithReserve(auth, now, window, 0)
+}
+
+func bestQuotaWindowScoreWithReserve(auth *Auth, now time.Time, window time.Duration, defaultReservePercent float64) (quotaWindowScore, bool) {
 	if auth == nil {
 		return quotaWindowScore{}, false
 	}
@@ -820,8 +824,12 @@ func bestQuotaWindowScore(auth *Auth, now time.Time, window time.Duration) (quot
 			remainingMinutes = quotaPriorityScoreMinMinutes
 		}
 		spendablePercent := percent
+		reservePercent := normalizeQuotaReservePercent(defaultReservePercent)
 		if threshold, configured := oauthWeeklyQuotaReservePercent(auth.Attributes); configured && windowDuration == 7*24*time.Hour {
-			spendablePercent -= scaleQuotaReservePercent(threshold, resetIn, windowDuration)
+			reservePercent = threshold
+		}
+		if reservePercent > 0 {
+			spendablePercent -= scaleQuotaReservePercent(reservePercent, resetIn, windowDuration)
 			if spendablePercent < 0 {
 				spendablePercent = 0
 			}
@@ -1158,12 +1166,12 @@ func quotaPriorityCandidateBefore(candidate *Auth, candidateWindow quotaWindowSc
 	return candidate.ID < picked.ID
 }
 
-func pickQuotaPriorityAuth(auths []*Auth, now time.Time, window time.Duration) (*Auth, bool) {
+func pickQuotaPriorityAuth(auths []*Auth, now time.Time, window time.Duration, quotaReservePercent float64) (*Auth, bool) {
 	var picked *Auth
 	var pickedWindow quotaWindowScore
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
-		windowScore, ok := bestQuotaWindowScore(candidate, now, window)
+		windowScore, ok := bestQuotaWindowScoreWithReserve(candidate, now, window, quotaReservePercent)
 		if !ok {
 			continue
 		}
@@ -1175,15 +1183,15 @@ func pickQuotaPriorityAuth(auths []*Auth, now time.Time, window time.Duration) (
 	return picked, picked != nil
 }
 
-func quotaPrioritySelectionScore(auth *Auth, now time.Time, window time.Duration) (float64, bool, time.Duration, bool) {
-	windowScore, ok := bestQuotaWindowScore(auth, now, window)
+func quotaPrioritySelectionScore(auth *Auth, now time.Time, window time.Duration, quotaReservePercent float64) (float64, bool, time.Duration, bool) {
+	windowScore, ok := bestQuotaWindowScoreWithReserve(auth, now, window, quotaReservePercent)
 	if !ok {
 		return 0, false, 0, false
 	}
 	return windowScore.Score, true, windowScore.ResetIn, true
 }
 
-func formatAuthSelectionCandidates(auths []*Auth, now time.Time, window time.Duration) string {
+func formatAuthSelectionCandidates(auths []*Auth, now time.Time, window time.Duration, quotaReservePercent float64) string {
 	if len(auths) == 0 {
 		return "[]"
 	}
@@ -1205,7 +1213,7 @@ func formatAuthSelectionCandidates(auths []*Auth, now time.Time, window time.Dur
 		winningWindow := "none"
 		resetIn := "unknown"
 		score := "n/a"
-		if windowScore, ok := bestQuotaWindowScore(auth, now, window); ok {
+		if windowScore, ok := bestQuotaWindowScoreWithReserve(auth, now, window, quotaReservePercent); ok {
 			winningWindow = windowScore.Name
 			resetIn = windowScore.ResetIn.Round(time.Second).String()
 			quota = fmt.Sprintf("%.2f", windowScore.RemainingPercent)
@@ -1220,7 +1228,7 @@ func formatAuthSelectionCandidates(auths []*Auth, now time.Time, window time.Dur
 	return "[" + strings.Join(parts, " ") + "]"
 }
 
-func quotaPrioritySelectedLogFields(auth *Auth, now time.Time, window time.Duration) (string, string, string, string, string) {
+func quotaPrioritySelectedLogFields(auth *Auth, now time.Time, window time.Duration, quotaReservePercent float64) (string, string, string, string, string) {
 	if auth == nil {
 		return "none", "unknown", "unknown", "n/a", "1.00"
 	}
@@ -1232,7 +1240,7 @@ func quotaPrioritySelectedLogFields(auth *Auth, now time.Time, window time.Durat
 	resetIn := "unknown"
 	score := "n/a"
 	multiplier := fmt.Sprintf("%.2f", quotaCapacityMultiplier(auth))
-	if windowScore, ok := bestQuotaWindowScore(auth, now, window); ok {
+	if windowScore, ok := bestQuotaWindowScoreWithReserve(auth, now, window, quotaReservePercent); ok {
 		winningWindow = windowScore.Name
 		resetIn = windowScore.ResetIn.Round(time.Second).String()
 		quota = fmt.Sprintf("%.2f", windowScore.RemainingPercent)
@@ -1439,13 +1447,13 @@ func (s *QuotaPrioritySelector) Pick(ctx context.Context, provider, model string
 		return nil, err
 	}
 	if picked, ok := pickQuotaWarmupAuth(available, now, quotaWindow); ok {
-		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow)
+		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow, s.QuotaReservePercent)
 		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-warmup auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s quota_reserve_percent=%.2f",
 			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown, normalizeQuotaReservePercent(s.QuotaReservePercent))
 		return picked, nil
 	}
-	if picked, ok := pickQuotaPriorityAuth(available, now, quotaWindow); ok {
-		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow)
+	if picked, ok := pickQuotaPriorityAuth(available, now, quotaWindow, s.QuotaReservePercent); ok {
+		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, quotaWindow, s.QuotaReservePercent)
 		selectorLogEntry(ctx).Infof("routing selector: selected | strategy=quota-priority reason=quota-window auth=%s provider=%s model=%s selectable=%d winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s quota_reserve_percent=%.2f",
 			picked.ID, provider, model, len(available), winningWindow, resetIn, quota, score, multiplier, normalizeQuotaReservePercent(s.QuotaReservePercent))
 		return picked, nil
@@ -1453,7 +1461,7 @@ func (s *QuotaPrioritySelector) Pick(ctx context.Context, provider, model string
 	entry := selectorLogEntry(ctx)
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		entry.Debugf("routing selector: no quota-priority candidates, falling back to round-robin | provider=%s model=%s selectable=%d quota_priority_window=%s auths=%s",
-			provider, model, len(available), quotaWindow, formatAuthSelectionCandidates(available, now, quotaWindow))
+			provider, model, len(available), quotaWindow, formatAuthSelectionCandidates(available, now, quotaWindow, s.QuotaReservePercent))
 	}
 	return (&s.roundRobin).pickAvailable(ctx, provider, model, available, s.QuotaReservePercent)
 }
@@ -1632,7 +1640,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 		if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 			entry.Debugf("session-affinity: cached auth not selectable | session=%s cached_auth=%s provider=%s model=%s selectable=%d quota_reserve_percent=%.2f selectable_auths=%s",
-				truncateSessionID(primaryID), cachedAuthID, provider, model, len(available), selectorQuotaReservePercent(s.fallback), formatAuthSelectionCandidates(available, now, quotaWindow))
+				truncateSessionID(primaryID), cachedAuthID, provider, model, len(available), selectorQuotaReservePercent(s.fallback), formatAuthSelectionCandidates(available, now, quotaWindow, selectorQuotaReservePercent(s.fallback)))
 		}
 		// Cached auth not selectable, reselect via fallback selector for even distribution.
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)

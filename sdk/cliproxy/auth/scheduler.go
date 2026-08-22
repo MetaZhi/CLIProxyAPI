@@ -315,11 +315,11 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		entries := shard.entriesAtPriorityLocked(preferWebsocket, priorityReady)
 		selectablePredicate := quotaReserveScheduledPredicate(entries, s.quotaReservePercent, selectionPredicate)
 		entry.Debugf("routing scheduler candidates | provider=%s model=%s strategy=%s priority=%d candidates=%d quota_reserve_percent=%.2f quota_priority_window=%s auths=%s",
-			providerKey, model, schedulerStrategyLogName(strategy), priorityReady, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, selectablePredicate, now, s.quotaWindow))
+			providerKey, model, schedulerStrategyLogName(strategy), priorityReady, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, selectablePredicate, now, s.quotaWindow, s.quotaReservePercent))
 	}
 	if okPriority {
 		if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, s.quotaWindow, s.quotaReservePercent, selectionPredicate); picked != nil {
-			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
+			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow, s.quotaReservePercent)
 			entry.Infof("routing scheduler: selected | provider=%s model=%s strategy=%s auth=%s priority=%d quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s",
 				providerKey, model, schedulerStrategyLogName(strategy), picked.ID, priorityReady, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier)
 			return picked, nil
@@ -395,11 +395,11 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			entries := shard.entriesAtPriorityLocked(false, priorityReady)
 			selectablePredicate := quotaReserveScheduledPredicate(entries, s.quotaReservePercent, selectionPredicate)
 			entry.Debugf("routing scheduler candidates | provider=%s model=%s strategy=%s priority=%d pinned_auth=%s candidates=%d quota_reserve_percent=%.2f quota_priority_window=%s auths=%s",
-				providerKey, model, schedulerStrategyLogName(strategy), priorityReady, pinnedAuthID, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, selectablePredicate, now, s.quotaWindow))
+				providerKey, model, schedulerStrategyLogName(strategy), priorityReady, pinnedAuthID, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, selectablePredicate, now, s.quotaWindow, s.quotaReservePercent))
 		}
 		if okPriority {
 			if picked := shard.pickReadyAtPriorityLocked(false, priorityReady, strategy, s.quotaWindow, s.quotaReservePercent, selectionPredicate); picked != nil {
-				winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
+				winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow, s.quotaReservePercent)
 				entry.Infof("routing scheduler: selected | provider=%s model=%s strategy=%s auth=%s priority=%d pinned_auth=%s quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s",
 					providerKey, model, schedulerStrategyLogName(strategy), picked.ID, priorityReady, pinnedAuthID, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier)
 				return picked, providerKey, nil
@@ -444,7 +444,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	if entry.Logger.IsLevelEnabled(log.DebugLevel) {
 		entries := scheduledEntriesAtPriority(candidateShards, bestPriority)
 		entry.Debugf("routing scheduler candidates | provider=mixed providers=%s model=%s strategy=%s priority=%d candidates=%d quota_reserve_percent=%.2f quota_priority_window=%s auths=%s",
-			strings.Join(normalized, ","), model, schedulerStrategyLogName(strategy), bestPriority, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, globalPredicate, now, s.quotaWindow))
+			strings.Join(normalized, ","), model, schedulerStrategyLogName(strategy), bestPriority, len(entries), s.quotaReservePercent, s.quotaWindow, formatScheduledSelectionCandidates(entries, globalPredicate, now, s.quotaWindow, s.quotaReservePercent))
 	}
 
 	if strategy == schedulerStrategyFillFirst {
@@ -455,7 +455,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			}
 			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, s.quotaWindow, 0, globalPredicate)
 			if picked != nil {
-				winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
+				winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow, s.quotaReservePercent)
 				entry.Infof("routing scheduler: selected | provider=mixed selected_provider=%s model=%s strategy=%s auth=%s priority=%d quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s",
 					providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier)
 				return picked, providerKey, nil
@@ -474,7 +474,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if picked == nil {
 				continue
 			}
-			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
+			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow, s.quotaReservePercent)
 			entry.Infof("routing scheduler: selected | provider=mixed selected_provider=%s model=%s strategy=%s reason=quota-warmup auth=%s priority=%d quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s probe_cooldown=%s",
 				providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier, quotaWarmupInFlightCooldown)
 			return picked, providerKey, nil
@@ -488,7 +488,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if shard == nil {
 				continue
 			}
-			candidate, windowScore, okWindow := shard.pickQuotaAtPriorityLocked(false, bestPriority, s.quotaWindow, 0, globalPredicate)
+			candidate, windowScore, okWindow := shard.pickQuotaAtPriorityLocked(false, bestPriority, s.quotaWindow, 0, s.quotaReservePercent, globalPredicate)
 			if candidate == nil {
 				continue
 			}
@@ -502,7 +502,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			}
 		}
 		if pickedAuth != nil {
-			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(pickedAuth, now, s.quotaWindow)
+			winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(pickedAuth, now, s.quotaWindow, s.quotaReservePercent)
 			entry.Infof("routing scheduler: selected | provider=mixed selected_provider=%s model=%s strategy=%s reason=quota-window auth=%s priority=%d quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s",
 				pickedProvider, model, schedulerStrategyLogName(strategy), pickedAuth.ID, bestPriority, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier)
 			return pickedAuth, pickedProvider, nil
@@ -587,7 +587,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			continue
 		}
 		s.mixedCursors[cursorKey] = slot + 1
-		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow)
+		winningWindow, resetIn, quota, score, multiplier := quotaPrioritySelectedLogFields(picked, now, s.quotaWindow, s.quotaReservePercent)
 		entry.Infof("routing scheduler: selected | provider=mixed selected_provider=%s model=%s strategy=%s reason=round-robin auth=%s priority=%d cursor=%d quota_reserve_percent=%.2f winning_window=%s reset_in=%s quota_percent=%s score=%s plan_multiplier=%s",
 			providerKey, model, schedulerStrategyLogName(strategy), picked.ID, bestPriority, slot, s.quotaReservePercent, winningWindow, resetIn, quota, score, multiplier)
 		return picked, providerKey, nil
@@ -625,7 +625,7 @@ func scheduledEntriesAtPriority(shards []*modelScheduler, priority int) []*sched
 	return entries
 }
 
-func formatScheduledSelectionCandidates(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, window time.Duration) string {
+func formatScheduledSelectionCandidates(entries []*scheduledAuth, predicate func(*scheduledAuth) bool, now time.Time, window time.Duration, quotaReservePercent float64) string {
 	auths := make([]*Auth, 0, len(entries))
 	for _, entry := range entries {
 		if entry == nil || entry.auth == nil {
@@ -636,7 +636,7 @@ func formatScheduledSelectionCandidates(entries []*scheduledAuth, predicate func
 		}
 		auths = append(auths, entry.auth)
 	}
-	return formatAuthSelectionCandidates(auths, now, window)
+	return formatAuthSelectionCandidates(auths, now, window, quotaReservePercent)
 }
 
 func (s *authScheduler) mixedQuotaReservePredicateLocked(shards []*modelScheduler, priority int, threshold float64, predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
@@ -1046,7 +1046,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
 	} else if strategy == schedulerStrategyQuota {
-		picked = view.pickQuotaPriority(time.Now(), quotaWindow, predicate)
+		picked = view.pickQuotaPriority(time.Now(), quotaWindow, quotaReservePercent, predicate)
 	} else if strategy == schedulerStrategyWeightedRoundRobin {
 		picked = view.pickWeighted(predicate)
 	} else {
@@ -1058,7 +1058,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) pickQuotaAtPriorityLocked(preferWebsocket bool, priority int, quotaWindow time.Duration, quotaReservePercent float64, predicate func(*scheduledAuth) bool) (*Auth, quotaWindowScore, bool) {
+func (m *modelScheduler) pickQuotaAtPriorityLocked(preferWebsocket bool, priority int, quotaWindow time.Duration, quotaReservePercent float64, scoreReservePercent float64, predicate func(*scheduledAuth) bool) (*Auth, quotaWindowScore, bool) {
 	if m == nil {
 		return nil, quotaWindowScore{}, false
 	}
@@ -1071,7 +1071,7 @@ func (m *modelScheduler) pickQuotaAtPriorityLocked(preferWebsocket bool, priorit
 		view = &bucket.ws
 	}
 	predicate = quotaReserveScheduledPredicate(view.flat, quotaReservePercent, predicate)
-	picked, windowScore, ok := view.firstQuotaPriorityCandidate(time.Now(), quotaWindow, predicate)
+	picked, windowScore, ok := view.firstQuotaPriorityCandidate(time.Now(), quotaWindow, scoreReservePercent, predicate)
 	if picked == nil || picked.auth == nil {
 		return nil, quotaWindowScore{}, false
 	}
@@ -1361,11 +1361,11 @@ func pickSmoothWeightedScheduled(entries []*scheduledAuth, current map[string]in
 	return picked
 }
 
-func (v *readyView) pickQuotaPriority(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) *scheduledAuth {
+func (v *readyView) pickQuotaPriority(now time.Time, window time.Duration, quotaReservePercent float64, predicate func(*scheduledAuth) bool) *scheduledAuth {
 	if picked := v.firstQuotaWarmupCandidate(now, window, predicate); picked != nil {
 		return picked
 	}
-	picked, _, ok := v.firstQuotaPriorityCandidate(now, window, predicate)
+	picked, _, ok := v.firstQuotaPriorityCandidate(now, window, quotaReservePercent, predicate)
 	if picked != nil {
 		return picked
 	}
@@ -1392,7 +1392,7 @@ func (v *readyView) firstQuotaWarmupCandidate(now time.Time, window time.Duratio
 	return nil
 }
 
-func (v *readyView) firstQuotaPriorityCandidate(now time.Time, window time.Duration, predicate func(*scheduledAuth) bool) (*scheduledAuth, quotaWindowScore, bool) {
+func (v *readyView) firstQuotaPriorityCandidate(now time.Time, window time.Duration, quotaReservePercent float64, predicate func(*scheduledAuth) bool) (*scheduledAuth, quotaWindowScore, bool) {
 	var picked *scheduledAuth
 	var pickedWindow quotaWindowScore
 	for _, entry := range v.flat {
@@ -1402,7 +1402,7 @@ func (v *readyView) firstQuotaPriorityCandidate(now time.Time, window time.Durat
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		windowScore, ok := bestQuotaWindowScore(entry.auth, now, window)
+		windowScore, ok := bestQuotaWindowScoreWithReserve(entry.auth, now, window, quotaReservePercent)
 		if !ok {
 			continue
 		}
