@@ -25,19 +25,21 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy            string
-	quotaReservePercent float64
-	quotaPriorityWindow time.Duration
-	sessionAffinity     bool
-	sessionAffinityTTL  time.Duration
+	strategy                 string
+	quotaReservePercent      float64
+	quotaPriorityWindow      time.Duration
+	sessionAffinity          bool
+	sessionAffinityTTL       time.Duration
+	sessionAffinitySubagents bool
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:            "round-robin",
-		quotaReservePercent: coreauth.DefaultQuotaReservePercent,
-		quotaPriorityWindow: coreauth.DefaultQuotaPriorityWindow,
-		sessionAffinityTTL:  time.Hour,
+		strategy:                 "round-robin",
+		quotaReservePercent:      coreauth.DefaultQuotaReservePercent,
+		quotaPriorityWindow:      coreauth.DefaultQuotaPriorityWindow,
+		sessionAffinityTTL:       time.Hour,
+		sessionAffinitySubagents: true,
 	}
 	if cfg == nil {
 		return state
@@ -54,8 +56,14 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
+			if parsed < time.Second {
+				parsed = time.Second
+			}
 			state.sessionAffinityTTL = parsed
 		}
+	}
+	if state.sessionAffinity && cfg.Routing.SessionAffinitySubagents != nil {
+		state.sessionAffinitySubagents = *cfg.Routing.SessionAffinitySubagents
 	}
 	return state
 }
@@ -76,9 +84,11 @@ func newRoutingSelectorFromRuntimeState(state routingRuntimeState) coreauth.Sele
 		selector = &coreauth.RoundRobinSelector{QuotaReservePercent: state.quotaReservePercent}
 	}
 	if state.sessionAffinity {
+		subagents := state.sessionAffinitySubagents
 		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-			Fallback: selector,
-			TTL:      state.sessionAffinityTTL,
+			Fallback:         selector,
+			TTL:              state.sessionAffinityTTL,
+			SubagentAffinity: &subagents,
 		})
 	}
 	return selector
