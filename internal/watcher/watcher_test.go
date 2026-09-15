@@ -1123,6 +1123,10 @@ func TestHandleEventAtomicReplaceChangedTriggersUpdate(t *testing.T) {
 	if atomic.LoadInt32(&reloads) != 0 {
 		t.Fatalf("expected changed atomic replace to avoid global reload, got %d", reloads)
 	}
+	newSum := sha256.Sum256(newContent)
+	if got := w.lastAuthHashes[w.normalizeAuthPath(authFile)]; got != hexString(newSum[:]) {
+		t.Fatalf("expected changed atomic replace to refresh hash, got %q", got)
+	}
 }
 
 func TestHandleEventRemoveUnknownFileIgnored(t *testing.T) {

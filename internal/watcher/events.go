@@ -102,12 +102,12 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		// Wait briefly; if the path exists again, treat as an update instead of removal.
 		time.Sleep(replaceCheckDelay)
 		if _, statErr := os.Stat(event.Name); statErr == nil {
-			if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
-				log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
-				return
-			}
+			// A replacement event must be parsed even when a concurrent scan has
+			// already refreshed the hash cache. The synthesized auth diff still
+			// suppresses no-op updates after parsing.
+			w.invalidateAuthFileHash(normalizedName)
 			log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-			w.addOrUpdateClientLocked(event.Name)
+			w.addOrUpdateClientLockedForce(event.Name)
 			return
 		}
 		if !w.isKnownAuthFile(event.Name) {
@@ -126,6 +126,23 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
 		w.addOrUpdateClientLocked(event.Name)
 	}
+}
+
+func (w *Watcher) invalidateAuthFileHash(path string) {
+	if w == nil {
+		return
+	}
+	normalized := w.normalizeAuthPath(path)
+	if normalized == "" {
+		return
+	}
+	w.clientsMutex.Lock()
+	if w.lastAuthHashes != nil {
+		if _, known := w.lastAuthHashes[normalized]; known {
+			w.lastAuthHashes[normalized] = ""
+		}
+	}
+	w.clientsMutex.Unlock()
 }
 
 // observeAuthFile invalidates in-flight scans even if hash or content deduplication

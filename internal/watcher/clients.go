@@ -169,6 +169,14 @@ func (w *Watcher) addOrUpdateClient(path string) {
 }
 
 func (w *Watcher) addOrUpdateClientLocked(path string) {
+	w.addOrUpdateClientLockedWithOptions(path, false)
+}
+
+func (w *Watcher) addOrUpdateClientLockedForce(path string) {
+	w.addOrUpdateClientLockedWithOptions(path, true)
+}
+
+func (w *Watcher) addOrUpdateClientLockedWithOptions(path string, force bool) {
 	w.observeAuthFile(path)
 	data, errRead := os.ReadFile(path)
 	if errRead != nil {
@@ -204,10 +212,12 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 	if w.fileAuthsByPath == nil {
 		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
 	}
-	if prev, ok := w.lastAuthHashes[normalized]; ok && prev == curHash {
-		log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(path))
-		w.clientsMutex.Unlock()
-		return
+	if !force {
+		if prev, ok := w.lastAuthHashes[normalized]; ok && prev == curHash {
+			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(path))
+			w.clientsMutex.Unlock()
+			return
+		}
 	}
 
 	// Get old auth for diff comparison
@@ -268,7 +278,7 @@ func (w *Watcher) addOrUpdateClientLocked(path string) {
 	updates := w.computePerPathUpdatesLocked(oldByID, newByID)
 	w.clientsMutex.Unlock()
 
-	if errSynthesize == nil {
+	if errSynthesize == nil && (!force || len(updates) > 0) {
 		w.persistAuthAsync(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path)
 	}
 	w.dispatchAuthUpdates(updates)
